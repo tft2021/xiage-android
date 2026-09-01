@@ -16,10 +16,22 @@ android {
         versionName = "1.0.0"
     }
 
+    signingConfigs {
+        create("release") {
+            // CI 测试签名：公开仓库使用固定测试 keystore，保证每次构建签名一致、可覆盖安装。
+            // 正式对外发布前务必换成私有 keystore 并改由环境变量注入。
+            storeFile = rootProject.file("keystore/release-test.jks")
+            storePassword = "xiaozhi123456"
+            keyAlias = "xiaozhi"
+            keyPassword = "xiaozhi123456"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
