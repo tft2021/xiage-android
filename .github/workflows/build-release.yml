@@ -1,52 +1,66 @@
 name: Build Release APK
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "xiaozhi-android/**"
-      - ".github/workflows/build-release.yml"
   workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Set up Gradle 8.9
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.9"
+          gradle-version: 8.9
 
-      - name: Run core-protocol unit tests
-        working-directory: xiaozhi-android
-        run: gradle :core-protocol:test --no-daemon --stacktrace
+      # 若仓库配置了正式签名 Secret 则使用之，否则用仓库内测试 keystore（由 app/build.gradle.kts 自动回落）
+      - name: 注入正式签名密钥（如已配置）
+        env:
+          KS_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          KS_PW: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KS_KEY_PW: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "XIAOZHI_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "XIAOZHI_STORE_PASSWORD=$KS_PW" >> "$GITHUB_ENV"
+            echo "XIAOZHI_KEY_ALIAS=$KS_ALIAS" >> "$GITHUB_ENV"
+            echo "XIAOZHI_KEY_PASSWORD=$KS_KEY_PW" >> "$GITHUB_ENV"
+            echo "使用仓库 Secret 中的正式密钥"
+          else
+            echo "未配置签名 Secret，使用仓库内测试 keystore"
+          fi
 
-      - name: Build release APK
-        working-directory: xiaozhi-android
+      - name: 单元测试（core-protocol）
+        working-directory: ./xiaozhi-android
+        run: gradle :core-protocol:test --no-daemon
+
+      - name: 构建 Release APK
+        working-directory: ./xiaozhi-android
         run: gradle :app:assembleRelease --no-daemon --stacktrace
 
-      - name: Upload APK artifact
+      - name: 上传 APK 产物
         uses: actions/upload-artifact@v4
         with:
-          name: xiaozhi-release-apk
+          name: xiaozhi-android-release
           path: xiaozhi-android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
 
-      - name: Attach APK to GitHub Release
+      - name: 打 tag 时创建 Release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="build-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "xiaozhi APK $TAG" \
-            --notes "自动化构建。安装包为 CI 测试签名（仅供测试，正式发布需更换私有 keystore）。" \
-            xiaozhi-android/app/build/outputs/apk/release/*.apk
+        run: gh release create "$GITHUB_REF_NAME" xiaozhi-android/app/build/outputs/apk/release/*.apk --generate-notes --title "$GITHUB_REF_NAME"

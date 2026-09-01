@@ -18,12 +18,15 @@ android {
 
     signingConfigs {
         create("release") {
-            // CI 测试签名：公开仓库使用固定测试 keystore，保证每次构建签名一致、可覆盖安装。
-            // 正式对外发布前务必换成私有 keystore 并改由环境变量注入。
-            storeFile = rootProject.file("keystore/release-test.jks")
-            storePassword = "xiaozhi123456"
-            keyAlias = "xiaozhi"
-            keyPassword = "xiaozhi123456"
+            // 优先用 CI/本地环境变量注入的正式密钥；未注入时回落到仓库内的测试 keystore，
+            // 保证任何人 clone 后都能直接打出可安装、可覆盖升级的 release 包。
+            // 正式对外发布前务必换成私有 keystore，并通过下列环境变量注入：
+            //   XIAOZHI_KEYSTORE / XIAOZHI_STORE_PASSWORD / XIAOZHI_KEY_ALIAS / XIAOZHI_KEY_PASSWORD
+            storeFile = System.getenv("XIAOZHI_KEYSTORE")?.let { file(it) }
+                ?: rootProject.file("keystore/release-test.jks")
+            storePassword = System.getenv("XIAOZHI_STORE_PASSWORD") ?: "xiaozhi123456"
+            keyAlias = System.getenv("XIAOZHI_KEY_ALIAS") ?: "xiaozhi"
+            keyPassword = System.getenv("XIAOZHI_KEY_PASSWORD") ?: "xiaozhi123456"
         }
     }
 
