@@ -3,6 +3,7 @@ package com.xiaozhi.protocol.session
 import com.xiaozhi.protocol.audio.AudioCodecProvider
 import com.xiaozhi.protocol.audio.AudioIO
 import com.xiaozhi.protocol.audio.NoOpCodecProvider
+import com.xiaozhi.protocol.audio.OpusDecoder
 import com.xiaozhi.protocol.ota.ActivateResult
 import com.xiaozhi.protocol.ota.DeviceIdentity
 import com.xiaozhi.protocol.ota.OtaApi
@@ -213,11 +214,19 @@ class XiaozhiSession(
     }
 
     private suspend fun collectOpusFrames() {
-        val decoder = codecProvider.createDecoder()
+        // 解码器按下行采样率懒创建（hello 协商前默认 24k，协商后如有变化则重建）
+        var decoder: OpusDecoder? = null
+        var decoderRate = 0
         transport.opusFrames.collect { opus ->
+            if (decoderRate != downlinkSampleRate) {
+                decoder?.release()
+                decoder = codecProvider.createDecoder(downlinkSampleRate)
+                decoderRate = downlinkSampleRate
+            }
             val pcm = decoder?.decode(opus) ?: return@collect
             audio.enqueuePcm(pcm)
         }
+        decoder?.release()
     }
 
     // ------------------------------------------------------------------ 用户操作

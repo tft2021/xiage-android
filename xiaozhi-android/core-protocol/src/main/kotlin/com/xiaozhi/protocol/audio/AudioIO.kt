@@ -32,11 +32,15 @@ interface AudioIO {
  */
 interface AudioCodecProvider {
     fun createEncoder(): OpusEncoder?
-    fun createDecoder(): OpusDecoder?
+
+    /**
+     * @param sampleRate 下行采样率（以服务端 hello 协商为准，16k 或 24k）
+     */
+    fun createDecoder(sampleRate: Int): OpusDecoder?
 }
 
 /** 未接入 Opus 实现时的默认提供者，始终返回 null */
 class NoOpCodecProvider : AudioCodecProvider {
     override fun createEncoder(): OpusEncoder? = null
-    override fun createDecoder(): OpusDecoder? = null
+    override fun createDecoder(sampleRate: Int): OpusDecoder? = null
 }

@@ -16,7 +16,7 @@
 | 会话状态机 | ✅ 下沉到 `core-protocol/session/`，依赖全接口注入，JVM 可测 |
 | 音频采集 / 播放 | ✅ 已实现（`app/audio/AudioEngine`），VOICE_COMMUNICATION 音源启用系统 AEC |
 | 重采样 | ✅ 线性插值（`core-protocol/audio/Resampler`） |
-| **Opus 编解码** | ⚠️ **只有接口，未接实现**（`NoOpCodecProvider` 优雅降级），见下文「Opus 编解码选型」 |
+| **Opus 编解码** | ✅ Concentus（纯 Java 移植）已接入，见下文「Opus 编解码」 |
 | JVM 单元测试 | ✅ **51 个用例全部通过**（`core-protocol/src/test/`，`bash build-local.sh` 运行） |
 | 端到端协议回归 | ✅ 对真实服务器 11/11 通过（`../probe/e2e_regression.py`） |
 | UI | ⚠️ 基础骨架（激活码提示 / 表情 / 按住说话 / 打断），表情为纯文本占位 |
@@ -62,22 +62,16 @@ python ../probe/e2e_regression.py   # OTA v2 / UA 校验 / 激活 / WS hello / �
 
 依赖：Android Studio Ladybug+ / AGP 8.7 / Kotlin 2.0 / JDK 17。
 
-## Opus 编解码选型（接入前必须解决）
+## Opus 编解码（已接入 Concentus）
 
-`AudioCodecProvider` 目前用 `NoOpCodecProvider`（返回 null 优雅降级：协议与 UI
-正常工作、只是没有声音）。需要选一个实现接入：
+`AudioCodecProvider` 生产实现为 `ConcentusCodecProvider`：Concentus 纯 Java Opus
+移植（源码内嵌于 `core-protocol/src/main/java/org/concentus/`，含版权声明
+`CONCENTUS-LICENSE`），无 NDK 依赖。
 
-| 方案 | 依赖 | 优点 | 缺点 |
-|---|---|---|---|
-| **Concentus**（推荐起步） | 纯 Java，无 NDK | 接入最快，工程干净 | CPU 占用高于 native，低端机需验证 |
-| libopus + 自写 JNI | NDK | 性能最好，与固件一致 | 需要 NDK 工具链与 CMake 配置 |
-| opus-android 预编译 so | so 分发 | 省事 | 需自己维护各 ABI 的 so |
-
-接入点只有两处：`OpusEncoder.encode()` 与 `OpusDecoder.decode()`。
-参数约束：
-
-- 上行编码：16000 Hz / mono / **60ms 每帧**，每帧 960 个采样
-- 下行解码：服务端可能用 24000 Hz，解码后过 `Resampler` 再送 `AudioTrack`
+- 上行编码：16000 Hz / mono / 60ms（960 采样/帧），VOIP 模式，24kbps
+- 下行解码：按服务端 hello 协商采样率创建（16k / 24k 均验证）
+- `createDecoder(sampleRate)` 随下行采样率懒创建，协商变化时自动重建
+- 若后续低端机 CPU 吃紧，可换 libopus + JNI（接口不变，只换 Provider）
 
 ## 服务端
 
@@ -139,7 +133,7 @@ xiaozhi-android/
 
 ## 待办
 
-- [ ] 接入 Opus 编解码实现（阻塞项）
+- [x] 接入 Opus 编解码实现（Concentus，2026-09-01）
 - [ ] 唤醒词：sherpa-onnx KWS 或 Porcupine，或先维持按键说话
 - [ ] 语音会话迁入 `VoiceService`，处理切后台
 - [ ] 表情 / 字幕 UI 精化（Lottie 或自绘）

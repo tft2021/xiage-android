@@ -9,7 +9,7 @@ import com.xiaozhi.protocol.ota.DeviceIdentity
 import com.xiaozhi.protocol.ota.DeviceCredentials
 import com.xiaozhi.protocol.ota.PersistedIdentity
 import com.xiaozhi.protocol.session.XiaozhiSession
-import com.xiaozhi.protocol.audio.NoOpCodecProvider
+import com.xiaozhi.protocol.audio.ConcentusCodecProvider
 import com.xiaozhi.protocol.ws.XiaozhiWsClient
 import kotlinx.coroutines.launch
 
@@ -27,13 +27,12 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
     init {
         val audio = AudioEngine(viewModelScope)
         val transport = XiaozhiWsClient(viewModelScope)
-        // Opus 编解码尚未接入（见 README「Opus 编解码选型」），
-        // NoOpCodecProvider 优雅降级：协议与 UI 正常，只是没有声音
+        // Concentus（纯 Java Opus）编解码：上行 16k/60ms，下行按 hello 协商采样率
         session = XiaozhiSession(
             scope = viewModelScope,
             transport = transport,
             audio = audio,
-            codecProvider = NoOpCodecProvider(),
+            codecProvider = ConcentusCodecProvider(),
         )
     }
 
