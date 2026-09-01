@@ -21,6 +21,20 @@
 | 端到端协议回归 | ✅ 对真实服务器 11/11 通过（`../probe/e2e_regression.py`） |
 | UI | ⚠️ 基础骨架（激活码提示 / 表情 / 按住说话 / 打断），表情为纯文本占位 |
 
+## 获取 APK
+
+方式一：直接下载已构建好的安装包
+→ https://github.com/tft2021/xiage-android/releases/latest
+
+方式二：GitHub Actions 自动构建（push main / 手动触发 / 打 tag v*）：
+- 每次 push 到 main 都会跑 core-protocol 单测并打 release APK，产物在 Actions 页面下载
+- 打 `v*` tag 时自动创建 Release 并挂载 APK
+- 构建失败时日志自动归档到 `ci-logs` 分支的 `logs/run-<id>.txt`（Actions 日志需登录才能下载）
+
+签名：优先读环境变量 `XIAOZHI_KEYSTORE` / `XIAOZHI_STORE_PASSWORD` / `XIAOZHI_KEY_ALIAS` /
+`XIAOZHI_KEY_PASSWORD`；未注入时回落到仓库内测试 keystore（`keystore/release-test.jks`），
+保证 clone 即可构建。**正式对外发布前必须换成私有 keystore**，通过仓库 Secret 注入。
+
 ## 编译与测试（无 Android SDK 环境）
 
 本机已搭好纯 JVM 编译环境（Microsoft JDK 17 + kotlin-compiler 2.0.21 + Maven Central jar，
