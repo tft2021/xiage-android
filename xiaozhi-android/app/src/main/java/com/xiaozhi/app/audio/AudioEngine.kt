@@ -111,7 +111,8 @@ class AudioEngine(private val scope: CoroutineScope) : AudioIO {
             )
             .setTransferMode(AudioTrack.MODE_STREAM)
             .setBufferSizeInBytes(maxOf(minBuf, sampleRate / 5 * 2))
-            .setAudioSessionId(AudioManager.AUDIO_SESSION_ID_GENERATE)
+            // AudioTrack.Builder 的方法名是 setSessionId（不是 setAudioSessionId）
+            .setSessionId(AudioManager.AUDIO_SESSION_ID_GENERATE)
             .build()
             .also { it.play() }
     }
