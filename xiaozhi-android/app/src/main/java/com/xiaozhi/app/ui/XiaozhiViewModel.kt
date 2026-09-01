@@ -37,6 +37,9 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
         )
     }
 
+    /** ViewModel 生命周期内的 Application Context，用于身份持久化 */
+    private val appContext: Context get() = getApplication()
+
     /** 连接入口：由 UI 显式触发（首次进入不自动连，等麦克风权限就绪） */
     fun start(onActivationCode: (String) -> Unit) {
         viewModelScope.launch {

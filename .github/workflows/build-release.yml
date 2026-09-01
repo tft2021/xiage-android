@@ -49,8 +49,34 @@ jobs:
         run: gradle :core-protocol:test --no-daemon
 
       - name: 构建 Release APK
+        id: build
         working-directory: ./xiaozhi-android
-        run: gradle :app:assembleRelease --no-daemon --stacktrace
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          gradle :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # 构建日志默认只有登录 GitHub 才能下载，失败时把日志落到 ci-logs 分支便于排查
+      - name: 归档构建日志到 ci-logs 分支
+        if: steps.build.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git checkout --orphan ci-logs
+          git rm -rf . --quiet || true
+          mkdir -p logs
+          cp "$RUNNER_TEMP/build.log" "logs/run-${{ github.run_id }}.txt"
+          git add logs
+          git commit -m "CI 日志 run #${{ github.run_id }}（构建失败）" --quiet
+          git push -f origin ci-logs
+
+      - name: 构建失败即中止
+        if: steps.build.outcome == 'failure'
+        run: |
+          echo "::error::assembleRelease 失败，日志已归档到 ci-logs 分支 logs/run-${{ github.run_id }}.txt"
+          exit 1
 
       - name: 上传 APK 产物
         uses: actions/upload-artifact@v4
