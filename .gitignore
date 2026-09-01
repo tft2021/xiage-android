@@ -1,0 +1,23 @@
+# ---- 本地工具链与依赖（约 550MB，获取方式见 .tools/README.md，不入库）----
+.tools/
+
+# ---- WorkBuddy 会话内部数据 ----
+.workbuddy/
+
+# ---- 第三方参考仓库整包克隆（含 400+ wav 音频，协议摘录已入 py-xiaozhi-ref/）----
+py-xiaozhi-main/
+
+# ---- 构建产物 ----
+build/
+**/build/
+.gradle/
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ---- 系统杂项 ----
+.DS_Store
+Thumbs.db
