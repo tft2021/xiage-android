@@ -43,7 +43,13 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
     /** 连接入口：由 UI 显式触发（首次进入不自动连，等麦克风权限就绪） */
     fun start(onActivationCode: (String) -> Unit) {
         viewModelScope.launch {
-            session.start(loadIdentity(), onActivationCode)
+            session.start(
+                loadIdentity(),
+                onActivationCode,
+                // Session 检测到异常身份（服务端不下发激活码但只给测试组凭据）时
+                // 自动换新身份重试，这里负责把新身份持久化
+                onIdentityReset = { fresh -> persistIdentity(fresh) },
+            )
         }
     }
 
@@ -74,13 +80,19 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
 
         // 首次生成后立刻持久化，卸载前保持不变
         if (saved == null) {
-            sp.edit()
-                .putString("device_id", identity.deviceId)
-                .putString("client_id", identity.clientId)
-                .putString("serial_number", identity.credentials.serialNumber)
-                .putString("hmac_key", identity.credentials.hmacKey)
-                .apply()
+            persistIdentity(identity)
         }
         return identity
+    }
+
+    /** 身份持久化（首次生成与自动重置共用） */
+    private fun persistIdentity(identity: DeviceIdentity) {
+        val sp = appContext.getSharedPreferences("xiaozhi", Context.MODE_PRIVATE)
+        sp.edit()
+            .putString("device_id", identity.deviceId)
+            .putString("client_id", identity.clientId)
+            .putString("serial_number", identity.credentials.serialNumber)
+            .putString("hmac_key", identity.credentials.hmacKey)
+            .apply()
     }
 }

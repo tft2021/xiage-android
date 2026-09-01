@@ -142,7 +142,7 @@ class XiaozhiSessionTest {
             transport = transport, audio = audio, otaApi = ota,
         )
 
-        val ok = session.start(identity) { }
+        val ok = session.start(identity, { })
         assertTrue(ok, "已绑定设备应直接建立会话")
 
         // 用真实凭据连接
@@ -185,7 +185,7 @@ class XiaozhiSessionTest {
         )
 
         val codes = mutableListOf<String>()
-        val ok = session.start(identity) { codes.add(it) }
+        val ok = session.start(identity, { codes.add(it) })
         assertTrue(ok)
 
         // 展示过激活码，并按挑战值轮询激活
@@ -217,7 +217,7 @@ class XiaozhiSessionTest {
             activationTimeoutMs = 120,
         )
 
-        val ok = session.start(identity) { }
+        val ok = session.start(identity, { })
         assertFalse(ok, "激活超时应返回 false")
         assertIs<XiaozhiSession.Phase.NeedActivation>(session.phase.value)
         assertTrue(transport.connectedUrl == null, "不应发起连接")
@@ -228,11 +228,12 @@ class XiaozhiSessionTest {
 
     @Test
     fun `服务端仍下发测试组凭据时报错不连接`() = runBlocking {
-        val config = OtaConfig.minimal(
+        // 重置身份重试后仍是测试组 -> 报错（两份配置都是测试组且无激活码）
+        val bad = OtaConfig.minimal(
             websocketUrl = "wss://fake/v1/",
             websocketToken = OtaConfig.TEST_TOKEN,
         )
-        val ota = FakeOtaApi(mutableListOf(config), mutableListOf())
+        val ota = FakeOtaApi(mutableListOf(bad, bad), mutableListOf())
         val transport = FakeTransport()
         val audio = FakeAudioIO()
         val session = XiaozhiSession(
@@ -240,11 +241,55 @@ class XiaozhiSessionTest {
             transport = transport, audio = audio, otaApi = ota,
         )
 
-        val ok = session.start(identity) { }
-        assertFalse(ok)
+        val resets = mutableListOf<DeviceIdentity>()
+        val ok = session.start(identity, { }, onIdentityReset = { resets.add(it) })
+        assertFalse(ok, "重试后仍是测试组凭据应报错")
         val err = assertIs<XiaozhiSession.Phase.Error>(session.phase.value)
         assertTrue(err.message.contains("绑定未生效"))
         assertTrue(transport.connectedUrl == null)
+        // 重试确实发生过：两次 OTA、一次身份重置
+        assertEquals(2, ota.checkVersionCalls.size)
+        assertEquals(1, resets.size)
+        session.stop()
+    }
+
+    @Test
+    fun `身份异常时自动重置身份重试后正常连接`() = runBlocking {
+        // 第一次：测试组凭据且无激活码（服务端不下发 activation 的异常身份）
+        val broken = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+        )
+        // 重置身份后：真实凭据
+        val healthy = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = "real-token",
+        )
+        val ota = FakeOtaApi(mutableListOf(broken, healthy), mutableListOf())
+        val transport = FakeTransport()
+        val audio = FakeAudioIO()
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = transport, audio = audio, otaApi = ota,
+        )
+
+        val resets = mutableListOf<DeviceIdentity>()
+        val ok = session.start(identity, { }, onIdentityReset = { resets.add(it) })
+        assertTrue(ok, "重置身份后应成功建立会话")
+
+        // 第二次 OTA 用的是全新身份，且新身份被回调通知持久化
+        assertEquals(2, ota.checkVersionCalls.size)
+        val secondIdentity = ota.checkVersionCalls[1]
+        assertFalse(
+            secondIdentity.deviceId == identity.deviceId &&
+                secondIdentity.clientId == identity.clientId,
+            "重试必须使用全新身份",
+        )
+        assertEquals(listOf(secondIdentity), resets)
+
+        assertEquals("real-token", transport.connectedToken)
+        transport.open()
+        awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
         session.stop()
     }
 
@@ -261,7 +306,7 @@ class XiaozhiSessionTest {
         val transport = session.transportFieldForTest()
         val audio = session.audioFieldForTest()
 
-        session.start(identity) { }
+        session.start(identity, { })
         transport.open()
         awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
 
@@ -289,7 +334,7 @@ class XiaozhiSessionTest {
         )
         val transport = session.transportFieldForTest()
 
-        session.start(identity) { }
+        session.start(identity, { })
         transport.open()
         awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
 
@@ -313,7 +358,7 @@ class XiaozhiSessionTest {
         )
         val transport = session.transportFieldForTest()
         val audio = session.audioFieldForTest()
-        session.start(identity) { }
+        session.start(identity, { })
         session.stop()
         assertEquals(XiaozhiSession.Phase.Idle, session.phase.value)
         assertTrue(transport.closed)

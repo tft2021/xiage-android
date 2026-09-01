@@ -73,18 +73,23 @@ class XiaozhiSession(
      * 启动会话。
      *
      * @param onNeedActivation 激活码回调，UI 应展示并引导用户到 xiaozhi.me 输入
+     * @param onIdentityReset 身份自动重置回调（见下），UI 应持久化新身份
      * @return true 表示会话建立完成（进入 Ready）；false 表示停留在激活或出错
      */
-    suspend fun start(identity: DeviceIdentity, onNeedActivation: (String) -> Unit): Boolean {
-        this.identity = identity
+    suspend fun start(
+        identity: DeviceIdentity,
+        onNeedActivation: (String) -> Unit,
+        onIdentityReset: ((DeviceIdentity) -> Unit)? = null,
+    ): Boolean {
         stopped = false
         _phase.value = Phase.FetchingConfig
 
-        val config = try {
-            otaApi.checkVersion(identity)
+        val (effective, config) = try {
+            fetchConfigWithRecovery(identity, onIdentityReset)
         } catch (e: Exception) {
             return fail("OTA 失败: ${e.message}")
         }
+        this.identity = effective
 
         // 服务端未下发激活码说明该设备已绑定，直接进会话
         if (!config.needsActivation) {
@@ -101,7 +106,7 @@ class XiaozhiSession(
         var activated = false
         val deadline = System.currentTimeMillis() + activationTimeoutMs
         while (!activated && System.currentTimeMillis() < deadline && !stopped) {
-            when (otaApi.activate(identity, challenge)) {
+            when (otaApi.activate(effective, challenge)) {
                 ActivateResult.Success -> activated = true
                 ActivateResult.Waiting -> delay(activationPollIntervalMs)
                 is ActivateResult.Failed ->
@@ -112,11 +117,34 @@ class XiaozhiSession(
 
         // 激活成功后必须重新拉配置，才能拿到真实凭据（实测：激活前后 token 不同）
         val refreshed = try {
-            otaApi.checkVersion(identity)
+            otaApi.checkVersion(effective)
         } catch (e: Exception) {
             return fail("激活后重新拉取配置失败: ${e.message}")
         }
         return openSession(refreshed)
+    }
+
+    /**
+     * 拉取配置，带身份异常自愈。
+     *
+     * 实测（probe/probe_server_states.py + probe_deviceid_rule.py，2026-09-01）：
+     * 服务端对「退化 MAC」等被标记的身份返回 200 + 测试组凭据且【不下发 activation 段】
+     * （如 02:00:00:00:00:00 / AA:AA:AA:AA:AA:AA），客户端会误判为「已绑定但凭据异常」。
+     * 由于服务端并未认可绑定（token 仍是 test-token），此时重置设备身份零损失：
+     * 生成全新身份重新注册，最多重试一次。
+     */
+    private suspend fun fetchConfigWithRecovery(
+        identity: DeviceIdentity,
+        onIdentityReset: ((DeviceIdentity) -> Unit)?,
+    ): Pair<DeviceIdentity, OtaConfig> {
+        val first = otaApi.checkVersion(identity)
+        if (first.needsActivation || !first.isTestGroup) return identity to first
+
+        // 异常身份：换新身份重试一次
+        val fresh = DeviceIdentity.create(null)
+        onIdentityReset?.invoke(fresh) // 先持久化，避免中途被杀后下次又用旧身份
+        val second = otaApi.checkVersion(fresh)
+        return fresh to second
     }
 
     // ------------------------------------------------------------------ 会话
@@ -126,8 +154,11 @@ class XiaozhiSession(
         val token = config.websocketToken ?: return fail("服务端未返回 token")
 
         if (config.isTestGroup) {
-            // 拿到的仍是测试组凭据，通常意味着绑定没生效
-            return fail("凭据仍为测试组（GID_test / test-token），绑定未生效，请重新激活")
+            // 重置身份重试后仍是测试组凭据：绑定确实没生效，带出设备标识便于排查
+            return fail(
+                "凭据仍为测试组，绑定未生效。请在设置中重置设备身份后重试 " +
+                    "（device_id=${identity?.deviceId}, client_id=${identity?.clientId}）"
+            )
         }
 
         _phase.value = Phase.Connecting
