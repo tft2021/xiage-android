@@ -38,6 +38,15 @@ class XiaozhiSession(
     private val activationPollIntervalMs: Long = 5_000,
     /** 激活最长等待时间 */
     private val activationTimeoutMs: Long = 5 * 60_000,
+    /**
+     * 轮询期间重新拉配置刷新 challenge 的间隔。
+     * 实测：服务端每次 OTA 都换新 challenge，长期用旧 challenge 有失效风险。
+     */
+    private val challengeRefreshIntervalMs: Long = 60_000,
+    /** 激活成功后重新拉配置的次数（服务端绑定生效可能有短暂延迟） */
+    private val postActivateOtaRetries: Int = 3,
+    /** 激活成功后重新拉配置的重试间隔 */
+    private val postActivateRetryDelayMs: Long = 1_500,
 ) {
 
     sealed class Phase {
@@ -98,29 +107,85 @@ class XiaozhiSession(
         }
 
         // ---- 激活流程 ----
-        val code = config.activationCode ?: return fail("服务端未下发激活码")
-        val challenge = config.activationChallenge
-        if (challenge.isNullOrEmpty()) return fail("服务端未下发激活 challenge")
+        val initialCode = config.activationCode ?: return fail("服务端未下发激活码")
+        val initialChallenge = config.activationChallenge
+        if (initialChallenge.isNullOrEmpty()) return fail("服务端未下发激活 challenge")
+        var code: String = initialCode
+        var challenge: String = initialChallenge
         onNeedActivation(code)
         _phase.value = Phase.NeedActivation(code)
 
         var activated = false
         val deadline = System.currentTimeMillis() + activationTimeoutMs
+        var lastChallengeRefresh = System.currentTimeMillis()
         while (!activated && System.currentTimeMillis() < deadline && !stopped) {
-            when (otaApi.activate(effective, challenge)) {
+            // 实测：服务端每次 OTA 都会刷新 challenge，长期用旧 challenge 轮询有失效风险。
+            // 定期重新拉配置既刷新 challenge，又能顺带发现「用户已绑定」。
+            if (System.currentTimeMillis() - lastChallengeRefresh >= challengeRefreshIntervalMs) {
+                val polled = try {
+                    otaApi.checkVersion(effective)
+                } catch (_: Exception) {
+                    null // 轮询刷新失败不影响主流程，下一轮继续
+                }
+                if (polled != null) {
+                    lastChallengeRefresh = System.currentTimeMillis()
+                    // 只有"无激活码且非测试组"才算真正绑定成功。
+                    // 若刷新拿到测试组凭据（服务端瞬时脏响应），不能当成已绑定去连，
+                    // 也不能因此中断等待——保持原 challenge 继续轮询。
+                    if (!polled.needsActivation && !polled.isTestGroup) {
+                        return openSession(polled)
+                    }
+                    polled.activationChallenge?.let { challenge = it }
+                    val newCode = polled.activationCode
+                    if (newCode != null && newCode != code) {
+                        code = newCode
+                        onNeedActivation(code)
+                        _phase.value = Phase.NeedActivation(code)
+                    }
+                }
+            }
+
+            // 网络抖动不能让整个流程崩掉：异常等同 Waiting，下一轮继续
+            val result = try {
+                otaApi.activate(effective, challenge)
+            } catch (e: Exception) {
+                ActivateResult.Failed(NETWORK_ERROR_CODE, e.message.orEmpty())
+            }
+            when (result) {
                 ActivateResult.Success -> activated = true
                 ActivateResult.Waiting -> delay(activationPollIntervalMs)
                 is ActivateResult.Failed ->
-                    return fail("激活请求被拒绝，请检查网络或重新生成设备身份")
+                    if (result.code == NETWORK_ERROR_CODE) {
+                        delay(activationPollIntervalMs) // 网络问题：重试
+                    } else {
+                        return fail("激活请求被拒绝（HTTP ${result.code}），请检查网络后重试")
+                    }
             }
         }
-        if (stopped || !activated) return false
+        if (stopped) return false
+        if (!activated) {
+            return fail("等待绑定超时（${activationTimeoutMs / 1000}s 内未检测到激活），请点击连接重新获取激活码")
+        }
 
-        // 激活成功后必须重新拉配置，才能拿到真实凭据（实测：激活前后 token 不同）
-        val refreshed = try {
-            otaApi.checkVersion(effective)
-        } catch (e: Exception) {
-            return fail("激活后重新拉取配置失败: ${e.message}")
+        // 激活成功后必须重新拉配置，才能拿到真实凭据（实测：激活前后 token 不同）。
+        // 服务端绑定生效可能有短暂延迟，允许重试几次再判失败。
+        var refreshed: OtaConfig? = null
+        for (attempt in 1..postActivateOtaRetries) {
+            refreshed = try {
+                otaApi.checkVersion(effective)
+            } catch (_: Exception) {
+                null
+            }
+            if (refreshed != null && !refreshed.isTestGroup) break
+            if (attempt < postActivateOtaRetries) delay(postActivateRetryDelayMs)
+        }
+        // 重试耗尽仍是测试组：说明服务端尚未下发真实凭据，直接连必然被拒，
+        // 这里显式报错（而不是带测试组凭据去连），避免用户看到"凭据仍为测试组"的困惑提示。
+        if (refreshed == null || refreshed.isTestGroup) {
+            return fail(
+                "激活已提交，但服务端尚未下发真实凭据（已重试 $postActivateOtaRetries 次），" +
+                    "请稍后点击连接重试"
+            )
         }
         return openSession(refreshed)
     }
@@ -128,25 +193,41 @@ class XiaozhiSession(
     /**
      * 拉取配置，带身份异常自愈。
      *
-     * 实测（probe/probe_server_states.py + probe_deviceid_rule.py，2026-09-01）：
+     * 背景（实测，probe/probe_server_states.py + probe_deviceid_rule.py）：
      * 服务端对「退化 MAC」等被标记的身份返回 200 + 测试组凭据且【不下发 activation 段】
      * （如 02:00:00:00:00:00 / AA:AA:AA:AA:AA:AA），客户端会误判为「已绑定但凭据异常」。
-     * 由于服务端并未认可绑定（token 仍是 test-token），此时重置设备身份零损失：
-     * 生成全新身份重新注册，最多重试一次。
+     *
+     * 自愈策略刻意保守，因为丢弃身份是不可逆操作（已绑定设备换身份 = 被迫重新绑定）：
+     *  1. 同身份再拉一次，排除服务端瞬时抖动 / 限流导致的偶发脏响应
+     *  2. 仍异常才换新身份试探
+     *  3. 新身份【同样】异常 ⇒ 说明是服务端侧问题，回滚原身份，绝不丢弃
+     *     用户原有的绑定关系（若存在）得以保留
      */
     private suspend fun fetchConfigWithRecovery(
         identity: DeviceIdentity,
         onIdentityReset: ((DeviceIdentity) -> Unit)?,
     ): Pair<DeviceIdentity, OtaConfig> {
         val first = otaApi.checkVersion(identity)
-        if (first.needsActivation || !first.isTestGroup) return identity to first
+        if (isHealthy(first)) return identity to first
 
-        // 异常身份：换新身份重试一次
+        // 1) 同身份重试，排除偶发脏响应
+        val retry = otaApi.checkVersion(identity)
+        if (isHealthy(retry)) return identity to retry
+
+        // 2) 换新身份试探
         val fresh = DeviceIdentity.create(null)
-        onIdentityReset?.invoke(fresh) // 先持久化，避免中途被杀后下次又用旧身份
         val second = otaApi.checkVersion(fresh)
+
+        // 3) 新身份同样异常 -> 回滚原身份，不丢绑定
+        if (!isHealthy(second)) return identity to second
+
+        onIdentityReset?.invoke(fresh) // 只有确认新身份可用才持久化
         return fresh to second
     }
+
+    /** 健康 = 拿到真实凭据（已绑定）或拿到激活码（可走绑定流程） */
+    private fun isHealthy(config: OtaConfig): Boolean =
+        config.needsActivation || !config.isTestGroup
 
     // ------------------------------------------------------------------ 会话
 
@@ -275,5 +356,8 @@ class XiaozhiSession(
     companion object {
         const val DEFAULT_DOWNLINK_RATE = 24_000
         const val REASON_USER_ABORT = "user_interruption"
+
+        /** activate 网络异常的伪状态码（区别于真实 HTTP 状态码，用于区分重试策略） */
+        const val NETWORK_ERROR_CODE = -1
     }
 }

@@ -42,10 +42,18 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun XiaozhiScreen(vm: XiaozhiViewModel = viewModel()) {    val phase by vm.session.phase.collectAsState()
+fun XiaozhiScreen(vm: XiaozhiViewModel = viewModel()) {
+    val phase by vm.session.phase.collectAsState()
     val subtitle by vm.session.subtitle.collectAsState()
     val emotion by vm.session.emotion.collectAsState()
     var activationCode by remember { mutableStateOf<String?>(null) }
+
+    // 只有处于"需要激活"阶段才展示激活码卡片。
+    // 连接中 / 已就绪 / 出错（含激活超时）时旧码已失效，必须清掉，
+    // 否则用户会拿一个服务端已经作废的码去 xiaozhi.me 输入。
+    LaunchedEffect(phase) {
+        if (phase !is XiaozhiSession.Phase.NeedActivation) activationCode = null
+    }
 
     Surface(Modifier.fillMaxSize()) {
         Column(
@@ -108,7 +116,7 @@ fun XiaozhiScreen(vm: XiaozhiViewModel = viewModel()) {    val phase by vm.sessi
                 ) { Text(if (phase is XiaozhiSession.Phase.Listening) "停止" else "说话") }
 
                 OutlinedButton(
-                    onClick = { vm.start { activationCode = it } },
+                    onClick = { activationCode = null; vm.start { activationCode = it } },
                     enabled = phase is XiaozhiSession.Phase.Idle ||
                         phase is XiaozhiSession.Phase.Error ||
                         phase is XiaozhiSession.Phase.NeedActivation,

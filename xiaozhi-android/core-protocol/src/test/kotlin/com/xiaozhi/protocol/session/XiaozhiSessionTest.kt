@@ -92,6 +92,8 @@ private class FakeAudioIO : AudioIO {
 private class FakeOtaApi(
     private val configs: MutableList<OtaConfig>,
     private val activateResults: MutableList<ActivateResult>,
+    /** 前 N 次 activate 调用抛出网络异常，用于验证重试与防崩溃 */
+    var activateFailureCount: Int = 0,
 ) : OtaApi {
     val checkVersionCalls = mutableListOf<DeviceIdentity>()
     val activateCalls = mutableListOf<Pair<DeviceIdentity, String>>()
@@ -103,6 +105,10 @@ private class FakeOtaApi(
 
     override suspend fun activate(identity: DeviceIdentity, challenge: String): ActivateResult {
         activateCalls.add(identity to challenge)
+        if (activateFailureCount > 0) {
+            activateFailureCount--
+            throw java.io.IOException("模拟网络抖动")
+        }
         return activateResults.removeFirstOrNull() ?: ActivateResult.Waiting
     }
 }
@@ -202,7 +208,7 @@ class XiaozhiSessionTest {
     }
 
     @Test
-    fun `激活超时返回 false 且停在 NeedActivation`() = runBlocking {
+    fun `激活超时显式报错而不是静默停在 NeedActivation`() = runBlocking {
         val first = OtaConfig.minimal(
             activationCode = "999999",
             activationChallenge = "challenge-y",
@@ -215,11 +221,13 @@ class XiaozhiSessionTest {
             transport = transport, audio = audio, otaApi = ota,
             activationPollIntervalMs = 10,
             activationTimeoutMs = 120,
+            challengeRefreshIntervalMs = 10_000, // 本例不测刷新，避免消耗预置配置
         )
 
         val ok = session.start(identity, { })
         assertFalse(ok, "激活超时应返回 false")
-        assertIs<XiaozhiSession.Phase.NeedActivation>(session.phase.value)
+        val err = assertIs<XiaozhiSession.Phase.Error>(session.phase.value)
+        assertTrue(err.message.contains("等待绑定超时"), "实际: ${err.message}")
         assertTrue(transport.connectedUrl == null, "不应发起连接")
         session.stop()
     }
@@ -227,13 +235,14 @@ class XiaozhiSessionTest {
     // ---------------- 测试组凭据诊断 ----------------
 
     @Test
-    fun `服务端仍下发测试组凭据时报错不连接`() = runBlocking {
-        // 重置身份重试后仍是测试组 -> 报错（两份配置都是测试组且无激活码）
+    fun `服务端仍下发测试组凭据时报错不连接且回滚身份`() = runBlocking {
+        // 自愈三级都用尽仍是测试组（无激活码）-> 报错并回滚原身份，绝不丢弃已绑定的身份
         val bad = OtaConfig.minimal(
             websocketUrl = "wss://fake/v1/",
             websocketToken = OtaConfig.TEST_TOKEN,
         )
-        val ota = FakeOtaApi(mutableListOf(bad, bad), mutableListOf())
+        // first / 同身份 retry / 新身份 fresh 各一份
+        val ota = FakeOtaApi(mutableListOf(bad, bad, bad), mutableListOf())
         val transport = FakeTransport()
         val audio = FakeAudioIO()
         val session = XiaozhiSession(
@@ -245,27 +254,60 @@ class XiaozhiSessionTest {
         val ok = session.start(identity, { }, onIdentityReset = { resets.add(it) })
         assertFalse(ok, "重试后仍是测试组凭据应报错")
         val err = assertIs<XiaozhiSession.Phase.Error>(session.phase.value)
-        assertTrue(err.message.contains("绑定未生效"))
+        assertTrue(err.message.contains("绑定未生效"), "实际: ${err.message}")
         assertTrue(transport.connectedUrl == null)
-        // 重试确实发生过：两次 OTA、一次身份重置
-        assertEquals(2, ota.checkVersionCalls.size)
-        assertEquals(1, resets.size)
+        // 三级自愈确实发生过：first + 同身份 retry + 新身份 fresh
+        assertEquals(3, ota.checkVersionCalls.size)
+        assertEquals(identity.deviceId, ota.checkVersionCalls[0].deviceId)
+        assertEquals(identity.deviceId, ota.checkVersionCalls[1].deviceId, "第二级应复用原身份")
+        assertFalse(
+            ota.checkVersionCalls[2].deviceId == identity.deviceId,
+            "第三级应换新身份试探",
+        )
+        // 新身份同样异常 -> 不回调持久化，原身份保留（连接用的是原身份）
+        assertTrue(resets.isEmpty(), "新身份不可用时不得持久化")
+        session.stop()
+    }
+
+    @Test
+    fun `新身份同样异常时绝不替换已绑定身份`() = runBlocking {
+        // 已绑定设备遇到服务端偶发脏响应：不能因为一次异常就把已绑定身份换掉
+        val bad = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+        )
+        val ota = FakeOtaApi(mutableListOf(bad, bad, bad), mutableListOf())
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(), audio = FakeAudioIO(), otaApi = ota,
+        )
+        val resets = mutableListOf<DeviceIdentity>()
+        session.start(identity, { }, onIdentityReset = { resets.add(it) })
+        assertTrue(resets.isEmpty())
+        // 会话内部记录的身份仍是原身份（错误信息里带出）
+        val err = session.phase.value as XiaozhiSession.Phase.Error
+        assertTrue(err.message.contains(identity.deviceId), "实际: ${err.message}")
         session.stop()
     }
 
     @Test
     fun `身份异常时自动重置身份重试后正常连接`() = runBlocking {
-        // 第一次：测试组凭据且无激活码（服务端不下发 activation 的异常身份）
+        // first：测试组凭据且无激活码（服务端不下发 activation 的异常身份）
         val broken = OtaConfig.minimal(
             websocketUrl = "wss://fake/v1/",
             websocketToken = OtaConfig.TEST_TOKEN,
         )
-        // 重置身份后：真实凭据
+        // retry（同身份）：仍然异常
+        val brokenAgain = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+        )
+        // fresh（新身份）：真实凭据
         val healthy = OtaConfig.minimal(
             websocketUrl = "wss://fake/v1/",
             websocketToken = "real-token",
         )
-        val ota = FakeOtaApi(mutableListOf(broken, healthy), mutableListOf())
+        val ota = FakeOtaApi(mutableListOf(broken, brokenAgain, healthy), mutableListOf())
         val transport = FakeTransport()
         val audio = FakeAudioIO()
         val session = XiaozhiSession(
@@ -277,19 +319,199 @@ class XiaozhiSessionTest {
         val ok = session.start(identity, { }, onIdentityReset = { resets.add(it) })
         assertTrue(ok, "重置身份后应成功建立会话")
 
-        // 第二次 OTA 用的是全新身份，且新身份被回调通知持久化
-        assertEquals(2, ota.checkVersionCalls.size)
-        val secondIdentity = ota.checkVersionCalls[1]
+        // 三次 OTA：first -> 同身份 retry -> 新身份 fresh
+        assertEquals(3, ota.checkVersionCalls.size)
+        val secondIdentity = ota.checkVersionCalls[2]
         assertFalse(
-            secondIdentity.deviceId == identity.deviceId &&
+            secondIdentity.deviceId == identity.deviceId ||
                 secondIdentity.clientId == identity.clientId,
-            "重试必须使用全新身份",
+            "第三级必须使用全新身份",
         )
         assertEquals(listOf(secondIdentity), resets)
 
         assertEquals("real-token", transport.connectedToken)
         transport.open()
         awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
+        session.stop()
+    }
+
+    // ---------------- 激活链路健壮性 ----------------
+
+    @Test
+    fun `activate 网络异常不崩溃且自动重试`() = runBlocking {
+        val pending = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "555555",
+            activationChallenge = "challenge-n",
+        )
+        val bound = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "bound-token")
+        val ota = FakeOtaApi(
+            mutableListOf(pending, bound),
+            mutableListOf(ActivateResult.Success),
+            activateFailureCount = 2, // 前两次抛 IOException
+        )
+        val transport = FakeTransport()
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = transport, audio = FakeAudioIO(), otaApi = ota,
+            activationPollIntervalMs = 1,
+            challengeRefreshIntervalMs = 10_000,
+        )
+
+        val ok = session.start(identity, { })
+        assertTrue(ok, "网络抖动应被吞掉并重试，不能崩溃")
+        assertEquals(3, ota.activateCalls.size, "两次异常 + 一次成功")
+        assertEquals("bound-token", transport.connectedToken)
+        session.stop()
+    }
+
+    @Test
+    fun `activate 被服务端拒绝时立即报错不重试`() = runBlocking {
+        val pending = OtaConfig.minimal(
+            activationCode = "555555",
+            activationChallenge = "challenge-n",
+        )
+        val ota = FakeOtaApi(mutableListOf(pending), mutableListOf(ActivateResult.Failed(403, "forbidden")))
+        val transport = FakeTransport()
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = transport, audio = FakeAudioIO(), otaApi = ota,
+            activationPollIntervalMs = 1,
+            challengeRefreshIntervalMs = 10_000,
+        )
+
+        assertFalse(session.start(identity, { }))
+        val err = assertIs<XiaozhiSession.Phase.Error>(session.phase.value)
+        assertTrue(err.message.contains("403"), "实际: ${err.message}")
+        assertEquals(1, ota.activateCalls.size, "非网络错误不应重试")
+        session.stop()
+    }
+
+    @Test
+    fun `轮询期间刷新 challenge 并在检测到已绑定后直接进会话`() = runBlocking {
+        val pending1 = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "111111",
+            activationChallenge = "challenge-1",
+        )
+        val pending2 = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "111111",
+            activationChallenge = "challenge-2",
+        )
+        val bound = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "bound-token")
+        val ota = FakeOtaApi(mutableListOf(pending1, pending2, bound), mutableListOf(ActivateResult.Waiting))
+        val transport = FakeTransport()
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = transport, audio = FakeAudioIO(), otaApi = ota,
+            activationPollIntervalMs = 1,
+            challengeRefreshIntervalMs = 0, // 每轮都刷新，确定性触发
+        )
+
+        val ok = session.start(identity, { })
+        assertTrue(ok, "刷新到已绑定配置后应直接进入会话")
+        assertEquals(3, ota.checkVersionCalls.size)
+        assertTrue(
+            ota.activateCalls.any { it.second == "challenge-2" },
+            "应使用刷新后的 challenge 轮询，实际: ${ota.activateCalls.map { it.second }}",
+        )
+        assertEquals("bound-token", transport.connectedToken)
+        session.stop()
+    }
+
+    @Test
+    fun `刷新后激活码变化时更新 UI`() = runBlocking {
+        val pending1 = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "111111",
+            activationChallenge = "challenge-1",
+        )
+        val pending2 = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "222222",
+            activationChallenge = "challenge-2",
+        )
+        val bound = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "bound-token")
+        val ota = FakeOtaApi(mutableListOf(pending1, pending2, bound), mutableListOf(ActivateResult.Success))
+        val transport = FakeTransport()
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = transport, audio = FakeAudioIO(), otaApi = ota,
+            activationPollIntervalMs = 1,
+            challengeRefreshIntervalMs = 0,
+        )
+
+        val codes = mutableListOf<String>()
+        val ok = session.start(identity, { codes.add(it) })
+        assertTrue(ok)
+        assertEquals(listOf("111111", "222222"), codes, "激活码变化时应再次回调 UI")
+        assertEquals("bound-token", transport.connectedToken)
+        session.stop()
+    }
+
+    @Test
+    fun `激活后服务端延迟下发凭据时重试拉取`() = runBlocking {
+        val pending = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "777777",
+            activationChallenge = "challenge-z",
+        )
+        val stale1 = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = OtaConfig.TEST_TOKEN)
+        val stale2 = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = OtaConfig.TEST_TOKEN)
+        val bound = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "bound-token")
+        val ota = FakeOtaApi(
+            mutableListOf(pending, stale1, stale2, bound),
+            mutableListOf(ActivateResult.Success),
+        )
+        val transport = FakeTransport()
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = transport, audio = FakeAudioIO(), otaApi = ota,
+            challengeRefreshIntervalMs = 10_000,
+            postActivateOtaRetries = 3,
+            postActivateRetryDelayMs = 1,
+        )
+
+        val ok = session.start(identity, { })
+        assertTrue(ok, "重试后拿到真实凭据应成功")
+        assertEquals(4, ota.checkVersionCalls.size) // OTA + 3 次激活后重拉
+        assertEquals("bound-token", transport.connectedToken)
+        session.stop()
+    }
+
+    @Test
+    fun `激活后始终拿不到真实凭据时显式报错`() = runBlocking {
+        val pending = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "888888",
+            activationChallenge = "challenge-w",
+        )
+        val stale = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = OtaConfig.TEST_TOKEN)
+        val ota = FakeOtaApi(
+            mutableListOf(pending, stale, stale, stale),
+            mutableListOf(ActivateResult.Success),
+        )
+        val transport = FakeTransport()
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = transport, audio = FakeAudioIO(), otaApi = ota,
+            challengeRefreshIntervalMs = 10_000,
+            postActivateOtaRetries = 3,
+            postActivateRetryDelayMs = 1,
+        )
+
+        assertFalse(session.start(identity, { }))
+        val err = assertIs<XiaozhiSession.Phase.Error>(session.phase.value)
+        assertTrue(err.message.contains("尚未下发真实凭据"), "实际: ${err.message}")
+        assertTrue(transport.connectedUrl == null, "拿不到真实凭据时不应带测试组凭据去连")
         session.stop()
     }
 
