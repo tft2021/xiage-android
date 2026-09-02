@@ -1,6 +1,9 @@
 package com.xiaozhi.protocol.session
 
+import com.xiaozhi.protocol.audio.AudioCodecProvider
 import com.xiaozhi.protocol.audio.AudioIO
+import com.xiaozhi.protocol.audio.OpusDecoder
+import com.xiaozhi.protocol.audio.OpusEncoder
 import com.xiaozhi.protocol.ota.ActivateResult
 import com.xiaozhi.protocol.ota.DeviceIdentity
 import com.xiaozhi.protocol.ota.OtaApi
@@ -73,23 +76,67 @@ private class FakeTransport : XiaozhiTransport {
     }
 
     suspend fun emitMessage(msg: XiaozhiMessage) = _messages.emit(msg)
+
+    suspend fun emitOpus(data: ByteArray) = _opusFrames.emit(data)
 }
 
-private class FakeAudioIO : AudioIO {
+private class FakeAudioIO(
+    /** startCapture 抛异常：模拟麦克风未授权 / 设备不支持 16k 采集 */
+    var captureThrows: Exception? = null,
+    /** enqueuePcm 抛异常：模拟 AudioTrack 已被 release */
+    var enqueueThrows: Exception? = null,
+    /** flushPlayback 抛异常：模拟 AudioTrack 未初始化 */
+    var flushThrows: Exception? = null,
+    /** releaseAll 抛异常 */
+    var releaseThrows: Exception? = null,
+) : AudioIO {
     override var onPcmFrame: ((ShortArray) -> Unit)? = null
     var captureStarted = false
     var playbackRate: Int? = null
     val pcmReceived = mutableListOf<ShortArray>()
     var released = false
 
-    override fun startCapture() { captureStarted = true }
+    override fun startCapture() {
+        captureThrows?.let { throw it }
+        captureStarted = true
+    }
     override fun stopCapture() { captureStarted = false }
     override val isCapturing: Boolean get() = captureStarted
     override fun startPlayback(sampleRate: Int) { playbackRate = sampleRate }
-    override fun enqueuePcm(pcm: ShortArray) { pcmReceived.add(pcm) }
-    override fun flushPlayback() = Unit
+    override fun enqueuePcm(pcm: ShortArray) {
+        enqueueThrows?.let { throw it }
+        pcmReceived.add(pcm)
+    }
+    override fun flushPlayback() { flushThrows?.let { throw it } }
     override fun stopPlayback() = Unit
-    override fun releaseAll() { released = true }
+    override fun releaseAll() {
+        releaseThrows?.let { throw it }
+        released = true
+    }
+}
+
+/**
+ * 测试用解码器：默认把每个 Opus 帧解成固定长度的 PCM；
+ * [decodeThrows] 打开时模拟坏帧，用于验证异常不会取消整个 scope。
+ */
+private class FakeCodecProvider(
+    private val decodeThrows: Boolean = false,
+) : AudioCodecProvider {
+    val decodersCreated = mutableListOf<Int>()
+    var released = 0
+
+    override fun createEncoder(): OpusEncoder? = null
+
+    override fun createDecoder(sampleRate: Int): OpusDecoder? {
+        decodersCreated.add(sampleRate)
+        return object : OpusDecoder {
+            override fun decode(opus: ByteArray): ShortArray {
+                if (decodeThrows) error("模拟坏帧解码失败")
+                return ShortArray(opus.size.coerceAtLeast(1))
+            }
+            override fun release() { released++ }
+        }
+    }
 }
 
 private class FakeOtaApi(
@@ -693,6 +740,129 @@ class XiaozhiSessionTest {
         assertEquals(XiaozhiSession.Phase.Idle, session.phase.value)
         assertTrue(transport.closed)
         assertTrue(audio.released)
+    }
+
+    // -------------------------------------------- 第三轮加固：音频层异常防护
+
+    @Test
+    fun `录音启动失败时转成 Error 阶段而不是让异常穿出去`() = runBlocking {
+        val config = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "t")
+        val audio = FakeAudioIO(captureThrows = IllegalStateException("麦克风权限未授予"))
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(), audio = audio,
+            otaApi = FakeOtaApi(mutableListOf(config), mutableListOf()),
+        )
+        val transport = session.transportFieldForTest()
+        session.start(identity, { })
+        transport.open()
+        awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
+
+        // 麦克风不可用时 startListening 必须转成 Error 阶段：
+        // 绝不能让异常穿到 UI 线程崩掉 App，也不能停在中间态
+        session.startListening()
+        val phase = session.phase.value
+        assertIs<XiaozhiSession.Phase.Error>(phase)
+        assertTrue(phase.message.contains("录音"))
+        assertFalse(audio.captureStarted)
+        // 没有发出 Listen.START，也没有残留 PCM 回调
+        assertTrue(transport.sentMessages.none { it is XiaozhiMessage.Listen })
+        session.stop()
+    }
+
+    @Test
+    fun `坏音频帧不会取消整个会话`() = runBlocking {
+        val config = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "t")
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(), audio = FakeAudioIO(),
+            otaApi = FakeOtaApi(mutableListOf(config), mutableListOf()),
+            codecProvider = FakeCodecProvider(decodeThrows = true),
+        )
+        val transport = session.transportFieldForTest()
+        session.start(identity, { })
+        transport.open()
+        awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
+
+        // 坏帧导致解码抛异常：必须就地兜住。异常一旦逃逸会取消整个 scope，
+        // messageJob 一起被带走，之后任何消息都无法处理（界面永久卡死）
+        transport.emitOpus(byteArrayOf(1, 2, 3))
+        delay(200)
+
+        // 解码器挂了，但会话协议层必须还活着
+        transport.emitMessage(XiaozhiMessage.Tts(TtsState.START, null, "sess-1"))
+        awaitPhase(session) { it is XiaozhiSession.Phase.Speaking }
+        transport.emitMessage(XiaozhiMessage.Tts(TtsState.SENTENCE_START, "还在吗", "sess-1"))
+        delay(200)
+        assertEquals("还在吗", session.subtitle.value)
+        session.stop()
+    }
+
+    @Test
+    fun `消息处理抛异常不会取消整个会话`() = runBlocking {
+        val config = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "t")
+        val audio = FakeAudioIO(flushThrows = IllegalStateException("AudioTrack 未初始化"))
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(), audio = audio,
+            otaApi = FakeOtaApi(mutableListOf(config), mutableListOf()),
+        )
+        val transport = session.transportFieldForTest()
+        session.start(identity, { })
+        transport.open()
+        awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
+
+        // TTS START 处理中 flushPlayback 抛异常：phase 照常切到 Speaking，
+        // 且后续消息仍能被处理
+        transport.emitMessage(XiaozhiMessage.Tts(TtsState.START, "第一句", "sess-1"))
+        awaitPhase(session) { it is XiaozhiSession.Phase.Speaking }
+
+        transport.emitMessage(XiaozhiMessage.Stt("后续字幕", "sess-1"))
+        delay(200)
+        assertEquals("后续字幕", session.subtitle.value)
+        session.stop()
+    }
+
+    @Test
+    fun `打断时播放通道异常不会崩且能继续下一轮`() = runBlocking {
+        val config = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "t")
+        val audio = FakeAudioIO(flushThrows = IllegalStateException("AudioTrack 已被回收"))
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(), audio = audio,
+            otaApi = FakeOtaApi(mutableListOf(config), mutableListOf()),
+        )
+        val transport = session.transportFieldForTest()
+        session.start(identity, { })
+        transport.open()
+        awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
+
+        transport.emitMessage(XiaozhiMessage.Tts(TtsState.START, "我是小智", "sess-1"))
+        awaitPhase(session) { it is XiaozhiSession.Phase.Speaking }
+
+        // abort() 由 UI 线程同步调用，flush 抛异常也绝不能崩
+        session.abort()
+        assertEquals(XiaozhiSession.Phase.Ready::class, session.phase.value::class)
+        session.startListening()
+        assertEquals(XiaozhiSession.Phase.Listening, session.phase.value)
+        session.stop()
+    }
+
+    @Test
+    fun `stop 时释放资源抛异常也能正常回到 Idle`() = runBlocking {
+        val config = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "t")
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(),
+            audio = FakeAudioIO(releaseThrows = IllegalStateException("音频已释放")),
+            otaApi = FakeOtaApi(mutableListOf(config), mutableListOf()),
+        )
+        val transport = session.transportFieldForTest()
+        session.start(identity, { })
+        // releaseAll 抛异常不能阻断后续 close，phase 也要落到 Idle
+        session.stop()
+        assertEquals(XiaozhiSession.Phase.Idle, session.phase.value)
+        assertTrue(transport.closed)
     }
 }
 

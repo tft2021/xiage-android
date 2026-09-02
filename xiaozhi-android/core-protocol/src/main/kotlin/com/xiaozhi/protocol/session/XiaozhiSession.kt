@@ -14,6 +14,7 @@ import com.xiaozhi.protocol.ws.ConnectionState
 import com.xiaozhi.protocol.ws.TtsState
 import com.xiaozhi.protocol.ws.XiaozhiMessage
 import com.xiaozhi.protocol.ws.XiaozhiTransport
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -262,26 +263,41 @@ class XiaozhiSession(
 
     private suspend fun collectMessages() {
         transport.messages.collect { msg ->
-            when (msg) {
-                is XiaozhiMessage.Stt -> _subtitle.value = msg.text
-                is XiaozhiMessage.Llm -> {
-                    _emotion.value = msg.emotion
-                    if (msg.text.isNotEmpty()) _subtitle.value = msg.text
-                }
-                is XiaozhiMessage.Tts -> when (msg.state) {
-                    TtsState.START -> {
-                        _phase.value = Phase.Speaking(msg.text)
-                        audio.flushPlayback()
-                    }
-                    TtsState.SENTENCE_START -> msg.text?.let { _subtitle.value = it }
-                    TtsState.STOP -> if (_phase.value is Phase.Speaking) {
-                        _phase.value = Phase.Ready(downlinkSampleRate)
-                    }
-                }
-                is XiaozhiMessage.Alert ->
-                    _subtitle.value = "${msg.status}: ${msg.message}"
-                else -> Unit
+            // 单条消息处理失败绝不能让协程挂掉：本协程跑在外部 scope（生产是
+            // viewModelScope）上，异常逃逸会取消整个 scope，把连接状态收集、
+            // Opus 解码收集一起带走——用户只会看到界面"卡死"却没有任何提示。
+            try {
+                handleMessage(msg)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logW("处理消息失败: $msg", e)
             }
+        }
+    }
+
+    private fun handleMessage(msg: XiaozhiMessage) {
+        when (msg) {
+            is XiaozhiMessage.Stt -> _subtitle.value = msg.text
+            is XiaozhiMessage.Llm -> {
+                _emotion.value = msg.emotion
+                if (msg.text.isNotEmpty()) _subtitle.value = msg.text
+            }
+            is XiaozhiMessage.Tts -> when (msg.state) {
+                TtsState.START -> {
+                    _phase.value = Phase.Speaking(msg.text)
+                    // AudioTrack 尚未初始化或被 release 时 flush 会抛异常，
+                    // 由 collectMessages 统一兜住：丢一次 flush 不影响后续播放
+                    audio.flushPlayback()
+                }
+                TtsState.SENTENCE_START -> msg.text?.let { _subtitle.value = it }
+                TtsState.STOP -> if (_phase.value is Phase.Speaking) {
+                    _phase.value = Phase.Ready(downlinkSampleRate)
+                }
+            }
+            is XiaozhiMessage.Alert ->
+                _subtitle.value = "${msg.status}: ${msg.message}"
+            else -> Unit
         }
     }
 
@@ -292,7 +308,13 @@ class XiaozhiSession(
                     // 下行采样率以服务端 hello 协商结果为准（可能 24k，也可能 16k）
                     downlinkSampleRate = st.audioParams?.sampleRate ?: DEFAULT_DOWNLINK_RATE
                     _phase.value = Phase.Ready(downlinkSampleRate)
-                    audio.startPlayback(downlinkSampleRate)
+                    // 设备不支持该采样率时 AudioTrack 初始化会抛异常；
+                    // 这里必须接住，否则 stateJob 被取消，整个会话一起失效
+                    try {
+                        audio.startPlayback(downlinkSampleRate)
+                    } catch (e: Exception) {
+                        fail("无法启动音频播放（${downlinkSampleRate}Hz）: ${e.message}")
+                    }
                 }
                 is ConnectionState.Failed ->
                     if (_phase.value !is Phase.Error) fail("连接失败: ${st.reason}")
@@ -316,13 +338,21 @@ class XiaozhiSession(
         var decoder: OpusDecoder? = null
         var decoderRate = 0
         transport.opusFrames.collect { opus ->
-            if (decoderRate != downlinkSampleRate) {
-                decoder?.release()
-                decoder = codecProvider.createDecoder(downlinkSampleRate)
-                decoderRate = downlinkSampleRate
+            // 与 collectMessages 同理：坏帧（解码失败）或 AudioTrack 已被 release 时
+            // write 抛异常都要就地兜住，丢一帧音频用户无感，取消整个 scope 却是致命的
+            try {
+                if (decoderRate != downlinkSampleRate) {
+                    decoder?.release()
+                    decoder = codecProvider.createDecoder(downlinkSampleRate)
+                    decoderRate = downlinkSampleRate
+                }
+                val pcm = decoder?.decode(opus)
+                if (pcm != null) audio.enqueuePcm(pcm)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logW("解码/播放音频帧失败", e)
             }
-            val pcm = decoder?.decode(opus) ?: return@collect
-            audio.enqueuePcm(pcm)
         }
         decoder?.release()
     }
@@ -338,7 +368,15 @@ class XiaozhiSession(
         audio.onPcmFrame = { pcm ->
             enc?.let { e -> transport.sendOpus(e.encode(pcm)) }
         }
-        audio.startCapture()
+        // 麦克风未授权 / 设备不支持 16k 采集时 startCapture 会抛异常，
+        // 必须转成 Error 阶段：否则异常穿到 UI 线程直接崩 App
+        try {
+            audio.startCapture()
+        } catch (e: Exception) {
+            audio.onPcmFrame = null
+            fail("无法启动录音: ${e.message}")
+            return
+        }
         transport.send(XiaozhiMessage.Listen(com.xiaozhi.protocol.ws.ListenState.START))
         _phase.value = Phase.Listening
     }
@@ -346,15 +384,21 @@ class XiaozhiSession(
     /** 停止聆听，等服务端回复 */
     fun stopListening() {
         if (_phase.value !is Phase.Listening) return
-        transport.send(XiaozhiMessage.Listen(com.xiaozhi.protocol.ws.ListenState.STOP))
-        audio.stopCapture()
+        guard("停止录音") {
+            transport.send(XiaozhiMessage.Listen(com.xiaozhi.protocol.ws.ListenState.STOP))
+            audio.stopCapture()
+        }
         _phase.value = Phase.Ready(downlinkSampleRate)
     }
 
     /** 用户打断 TTS 播放 */
     fun abort() {
-        transport.send(XiaozhiMessage.Abort(REASON_USER_ABORT))
-        audio.flushPlayback()
+        // abort() 由 UI 直接同步调用（不在协程里），这里的任何异常都是直接崩 App。
+        // AudioTrack 未初始化或被系统回收时 pause()/flush() 会抛 IllegalStateException。
+        guard("打断播放") {
+            transport.send(XiaozhiMessage.Abort(REASON_USER_ABORT))
+            audio.flushPlayback()
+        }
         // 立刻回到 Ready，让用户能马上接下一句，不必等服务端补发 TTS stop。
         // 服务端随后若发来 TTS stop，collectMessages 里只处理 Speaking 态，不会重复切换。
         if (_phase.value is Phase.Speaking) _phase.value = Phase.Ready(downlinkSampleRate)
@@ -366,13 +410,33 @@ class XiaozhiSession(
         // 而 stateJob 的取消是异步生效的，晚一步就把主动断开误判成"被服务端关闭"了
         _phase.value = Phase.Idle
         decoderJob?.cancel(); messageJob?.cancel(); stateJob?.cancel()
-        audio.releaseAll()
-        transport.close()
+        guard("释放音频资源") { audio.releaseAll() }
+        guard("关闭连接") { transport.close() }
     }
 
     private fun fail(message: String): Boolean {
         _phase.value = Phase.Error(message)
         return false
+    }
+
+    /**
+     * 非致命内部异常记录。core-protocol 是纯 JVM 模块，不能依赖 android.util.Log；
+     * Android 上 System.err 同样会落到 logcat，排查时按 "XiaozhiSession:" 过滤即可。
+     */
+    private fun logW(message: String, e: Throwable) {
+        System.err.println("XiaozhiSession: $message: ${e.message}")
+    }
+
+    /**
+     * [stopListening] / [abort] / [stop] 都是 UI 线程同步调用的（不跑在协程里），
+     * 里面任何异常都无处传播、直接崩 App。这里统一兜住并记日志。
+     */
+    private fun guard(what: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Exception) {
+            logW(what + "失败", e)
+        }
     }
 
     companion object {
