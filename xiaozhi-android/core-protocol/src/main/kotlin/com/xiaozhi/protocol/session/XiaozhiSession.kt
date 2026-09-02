@@ -232,8 +232,11 @@ class XiaozhiSession(
     // ------------------------------------------------------------------ 会话
 
     private fun openSession(config: OtaConfig): Boolean {
-        val url = config.websocketUrl ?: return fail("服务端未返回 WebSocket 地址")
-        val token = config.websocketToken ?: return fail("服务端未返回 token")
+        // 用 isNullOrBlank 而不是判空：畸形响应可能给空串，空串会骗过 ?: 判空
+        val url = config.websocketUrl.takeUnless { it.isNullOrBlank() }
+            ?: return fail("服务端未返回 WebSocket 地址")
+        val token = config.websocketToken.takeUnless { it.isNullOrBlank() }
+            ?: return fail("服务端未返回 token")
 
         if (config.isTestGroup) {
             // 重置身份重试后仍是测试组凭据：绑定确实没生效，带出设备标识便于排查
@@ -247,8 +250,14 @@ class XiaozhiSession(
         messageJob = scope.launch { collectMessages() }
         stateJob = scope.launch { collectConnectionState() }
         decoderJob = scope.launch(Dispatchers.IO) { collectOpusFrames() }
-        transport.connect(url, token, identity?.deviceId.orEmpty(), identity?.clientId.orEmpty())
-        return true
+        // OkHttp 的 newWebSocket 对非法 URL 是【同步抛异常】而不是回调 onFailure，
+        // 不接住的话异常会一路穿到 ViewModel 的 launch 里把 App 打崩。
+        return try {
+            transport.connect(url, token, identity?.deviceId.orEmpty(), identity?.clientId.orEmpty())
+            true
+        } catch (e: Exception) {
+            fail("建立连接失败: ${e.message}")
+        }
     }
 
     private suspend fun collectMessages() {
@@ -287,8 +296,16 @@ class XiaozhiSession(
                 }
                 is ConnectionState.Failed ->
                     if (_phase.value !is Phase.Error) fail("连接失败: ${st.reason}")
-                ConnectionState.Closed ->
-                    if (_phase.value is Phase.Listening) audio.stopCapture()
+                ConnectionState.Closed -> when (_phase.value) {
+                    is Phase.Listening -> audio.stopCapture()
+                    // 会话还没建立（没收到服务端 hello）就被关闭：典型原因是凭据无效，
+                    // 服务端给完 101 就直接 close。不处理的话 phase 会永远停在 Connecting，
+                    // 用户只看到"连接中..."却没有任何反馈。
+                    // 注意 Idle 要排除：stop() 会先 close 再置 Idle，那是主动断开。
+                    is Phase.Connecting ->
+                        fail("连接被服务端关闭（未收到 hello），凭据可能已失效，请重新点击连接")
+                    else -> Unit
+                }
                 else -> Unit
             }
         }
@@ -338,14 +355,19 @@ class XiaozhiSession(
     fun abort() {
         transport.send(XiaozhiMessage.Abort(REASON_USER_ABORT))
         audio.flushPlayback()
+        // 立刻回到 Ready，让用户能马上接下一句，不必等服务端补发 TTS stop。
+        // 服务端随后若发来 TTS stop，collectMessages 里只处理 Speaking 态，不会重复切换。
+        if (_phase.value is Phase.Speaking) _phase.value = Phase.Ready(downlinkSampleRate)
     }
 
     fun stop() {
         stopped = true
+        // 先置 Idle 再 close：transport.close() 会同步 emit Closed，
+        // 而 stateJob 的取消是异步生效的，晚一步就把主动断开误判成"被服务端关闭"了
+        _phase.value = Phase.Idle
         decoderJob?.cancel(); messageJob?.cancel(); stateJob?.cancel()
         audio.releaseAll()
         transport.close()
-        _phase.value = Phase.Idle
     }
 
     private fun fail(message: String): Boolean {

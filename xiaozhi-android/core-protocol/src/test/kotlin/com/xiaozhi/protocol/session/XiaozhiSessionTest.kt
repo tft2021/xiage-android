@@ -33,6 +33,8 @@ private class FakeTransport : XiaozhiTransport {
     var connectedUrl: String? = null
     var connectedToken: String? = null
     var closed = false
+    /** 故障注入：模拟 OkHttp 对非法 URL 同步抛异常（不是回调 onFailure） */
+    var connectThrows: Throwable? = null
 
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
     override val state: StateFlow<ConnectionState> = _state
@@ -44,6 +46,7 @@ private class FakeTransport : XiaozhiTransport {
     override val opusFrames: SharedFlow<ByteArray> = _opusFrames
 
     override fun connect(url: String, token: String, deviceId: String, clientId: String) {
+        connectThrows?.let { throw it }
         connectedUrl = url
         connectedToken = token
         _state.value = ConnectionState.Connecting
@@ -515,6 +518,87 @@ class XiaozhiSessionTest {
         session.stop()
     }
 
+    // ---------------- 传输层健壮性 ----------------
+
+    @Test
+    fun `connect 抛异常时报错而不是让协程崩掉`() = runBlocking {
+        // OkHttp 的 newWebSocket 对非法 URL 是【同步抛异常】，不回调 onFailure。
+        // 异常若穿出去会打死 ViewModel 的 launch 协程（App 崩溃）。
+        val config = OtaConfig.minimal(websocketUrl = "not a url", websocketToken = "t")
+        val transport = FakeTransport().apply {
+            connectThrows = IllegalArgumentException("expected URL scheme http or https")
+        }
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = transport, audio = FakeAudioIO(),
+            otaApi = FakeOtaApi(mutableListOf(config), mutableListOf()),
+        )
+
+        assertFalse(session.start(identity, { }), "connect 异常应转成失败而不是抛出")
+        val err = assertIs<XiaozhiSession.Phase.Error>(session.phase.value)
+        assertTrue(err.message.contains("建立连接失败"), "实际: ${err.message}")
+        session.stop()
+    }
+
+    @Test
+    fun `连接中被服务端关闭时显式报错而不是永远卡在连接中`() = runBlocking {
+        // 实测：拿未绑定凭据去连，nginx 给 101 后应用层直接 close，收不到 hello。
+        // 不处理的话 phase 会永远停在 Connecting，用户只看到"连接中..."。
+        val config = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "t")
+        val transport = FakeTransport()
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = transport, audio = FakeAudioIO(),
+            otaApi = FakeOtaApi(mutableListOf(config), mutableListOf()),
+        )
+
+        assertTrue(session.start(identity, { }))
+        assertEquals(XiaozhiSession.Phase.Connecting, session.phase.value)
+
+        transport.close("server rejected")
+        val err = awaitPhase(session) { it is XiaozhiSession.Phase.Error }
+        assertTrue(
+            (err as XiaozhiSession.Phase.Error).message.contains("未收到 hello"),
+            "实际: ${err.message}",
+        )
+        session.stop()
+    }
+
+    @Test
+    fun `畸形配置空串字段时报错不连接`() = runBlocking {
+        // org.json 的 optString 在字段缺失时返回空串（不是 null），
+        // 空串会骗过上层的 ?: 判空，导致拿空 URL 去建立 WebSocket。
+        val blank = OtaConfig.minimal(websocketUrl = "", websocketToken = "")
+        val transport = FakeTransport()
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = transport, audio = FakeAudioIO(),
+            otaApi = FakeOtaApi(mutableListOf(blank), mutableListOf()),
+        )
+
+        assertFalse(session.start(identity, { }))
+        val err = assertIs<XiaozhiSession.Phase.Error>(session.phase.value)
+        assertTrue(err.message.contains("WebSocket 地址"), "实际: ${err.message}")
+        assertTrue(transport.connectedUrl == null, "不能拿空 URL 去连")
+        session.stop()
+    }
+
+    @Test
+    fun `主动 stop 不会被误判成被服务端关闭`() = runBlocking {
+        // 回归保护：stop() 也会触发 Closed，必须区分主动断开与异常关闭
+        val config = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "t")
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(), audio = FakeAudioIO(),
+            otaApi = FakeOtaApi(mutableListOf(config), mutableListOf()),
+        )
+        session.start(identity, { })
+        session.stop()
+        assertEquals(XiaozhiSession.Phase.Idle, session.phase.value)
+        delay(50) // 给 collector 时间，确认不会翻成 Error
+        assertEquals(XiaozhiSession.Phase.Idle, session.phase.value)
+    }
+
     // ---------------- 会话内交互 ----------------
 
     @Test
@@ -567,6 +651,30 @@ class XiaozhiSessionTest {
 
         transport.emitMessage(XiaozhiMessage.Tts(TtsState.STOP, null, "sess-1"))
         awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
+        session.stop()
+    }
+
+    @Test
+    fun `打断后立即回到 Ready 可以接着开始下一轮对话`() = runBlocking {
+        val config = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "t")
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(), audio = FakeAudioIO(),
+            otaApi = FakeOtaApi(mutableListOf(config), mutableListOf()),
+        )
+        val transport = session.transportFieldForTest()
+        session.start(identity, { })
+        transport.open()
+        awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
+
+        transport.emitMessage(XiaozhiMessage.Tts(TtsState.START, "我是小智", "sess-1"))
+        awaitPhase(session) { it is XiaozhiSession.Phase.Speaking }
+
+        // 不等服务端补发 TTS stop，用户打断后应能立刻再说一句
+        session.abort()
+        assertEquals(XiaozhiSession.Phase.Ready::class, session.phase.value::class)
+        session.startListening()
+        assertEquals(XiaozhiSession.Phase.Listening, session.phase.value)
         session.stop()
     }
 

@@ -56,6 +56,9 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
     fun stopListening() = session.stopListening()
     fun abort() = session.abort()
 
+    /** 主动断开：关闭 WebSocket、释放音频，phase 回到 Idle 后可再次连接 */
+    fun disconnect() = session.stop()
+
     override fun onCleared() {
         session.stop()
     }

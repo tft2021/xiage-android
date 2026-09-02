@@ -29,7 +29,7 @@ class OtaClient(
     /** 服务端认识的板型名，沿用 py-xiaozhi 的值 */
     private val boardType: String = "bread-compact-wifi",
     private val appName: String = "xiaozhi-android",
-    private val appVersion: String = "2.1.3",
+    private val appVersion: String = "2.1.4",
     private val acceptLanguage: String = "zh-CN",
 ) : OtaApi {
 
@@ -128,24 +128,34 @@ class OtaClient(
         setRequestProperty("Content-Type", "application/json")
     }
 
+    /**
+     * 解析 OTA 响应。
+     *
+     * 必须用 [optNonEmptyString] 而不是 [JSONObject.optString]：org.json 的 optString
+     * 在字段缺失时返回 **空串**（不是 null），空串会骗过上层所有 `?:` 判空：
+     *  - `websocketUrl = ""`  -> 拿空 URL 去建立 WebSocket，OkHttp 直接抛 IllegalArgumentException
+     *  - `activationCode = ""` -> `needsActivation`（判 `!= null`）被误判为 true，
+     *    用户看到一个空白激活码；轮询刷新时还会把 challenge 覆盖成空串
+     *  - `websocketToken = ""` -> 绕开 `isTestGroup` 的 `token == "test-token"` 判据
+     */
     private fun parseConfig(root: JSONObject): OtaConfig {
         val ws = root.optJSONObject("websocket")
         val mqtt = root.optJSONObject("mqtt")
         val act = root.optJSONObject("activation")
         val fw = root.optJSONObject("firmware")
         return OtaConfig(
-            websocketUrl = ws?.optString("url"),
-            websocketToken = ws?.optString("token"),
-            mqttEndpoint = mqtt?.optString("endpoint"),
-            mqttClientId = mqtt?.optString("client_id"),
-            mqttUsername = mqtt?.optString("username"),
-            mqttPassword = mqtt?.optString("password"),
-            mqttPublishTopic = mqtt?.optString("publish_topic"),
-            mqttSubscribeTopic = mqtt?.optString("subscribe_topic"),
-            activationCode = act?.optString("code"),
-            activationChallenge = act?.optString("challenge"),
-            firmwareVersion = fw?.optString("version"),
-            firmwareUrl = fw?.optString("url"),
+            websocketUrl = ws?.optNonEmptyString("url"),
+            websocketToken = ws?.optNonEmptyString("token"),
+            mqttEndpoint = mqtt?.optNonEmptyString("endpoint"),
+            mqttClientId = mqtt?.optNonEmptyString("client_id"),
+            mqttUsername = mqtt?.optNonEmptyString("username"),
+            mqttPassword = mqtt?.optNonEmptyString("password"),
+            mqttPublishTopic = mqtt?.optNonEmptyString("publish_topic"),
+            mqttSubscribeTopic = mqtt?.optNonEmptyString("subscribe_topic"),
+            activationCode = act?.optNonEmptyString("code"),
+            activationChallenge = act?.optNonEmptyString("challenge"),
+            firmwareVersion = fw?.optNonEmptyString("version"),
+            firmwareUrl = fw?.optNonEmptyString("url"),
         )
     }
 
