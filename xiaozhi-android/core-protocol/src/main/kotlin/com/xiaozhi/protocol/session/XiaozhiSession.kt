@@ -21,7 +21,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 会话状态机：OTA 激活 -> WebSocket 会话 -> 音频收发
@@ -80,6 +82,16 @@ class XiaozhiSession(
     private var downlinkSampleRate: Int = DEFAULT_DOWNLINK_RATE
     private var stopped = false
 
+    /** 激活等待期"立即检测"信号：值变化即唤醒轮询，不必等满一个间隔 */
+    private val activationNudge = MutableStateFlow(0L)
+
+    /**
+     * start() 的世代号。每次 start() 自增；激活循环醒来时发现世代已变，
+     * 立即退出——解决"激活等待中点重新获取"时新旧循环并发的问题
+     * （不能用取消 Job 实现：start() 可能直接运行在测试的 runBlocking 上）
+     */
+    private var generation = 0L
+
     /**
      * 启动会话。
      *
@@ -92,6 +104,13 @@ class XiaozhiSession(
         onNeedActivation: (String) -> Unit,
         onIdentityReset: ((DeviceIdentity) -> Unit)? = null,
     ): Boolean {
+        // 防重入：激活/连接进行中再 start 会并发跑两个循环，互相覆盖 phase。
+        // UI 需要重新获取激活码时必须先 stop() 再 start()。
+        when (_phase.value) {
+            is Phase.FetchingConfig, is Phase.Connecting, is Phase.NeedActivation -> return false
+            else -> {}
+        }
+        val myGeneration = ++generation
         stopped = false
         _phase.value = Phase.FetchingConfig
 
@@ -120,6 +139,8 @@ class XiaozhiSession(
         val deadline = System.currentTimeMillis() + activationTimeoutMs
         var lastChallengeRefresh = System.currentTimeMillis()
         while (!activated && System.currentTimeMillis() < deadline && !stopped) {
+            // 被"重新获取"取代：新 start() 已把世代推进，本循环立即退场
+            if (generation != myGeneration) return false
             // 实测：服务端每次 OTA 都会刷新 challenge，长期用旧 challenge 轮询有失效风险。
             // 定期重新拉配置既刷新 challenge，又能顺带发现「用户已绑定」。
             if (System.currentTimeMillis() - lastChallengeRefresh >= challengeRefreshIntervalMs) {
@@ -154,16 +175,17 @@ class XiaozhiSession(
             }
             when (result) {
                 ActivateResult.Success -> activated = true
-                ActivateResult.Waiting -> delay(activationPollIntervalMs)
+                ActivateResult.Waiting -> waitActivationInterval()
                 is ActivateResult.Failed ->
                     if (result.code == NETWORK_ERROR_CODE) {
-                        delay(activationPollIntervalMs) // 网络问题：重试
+                        waitActivationInterval() // 网络问题：重试
                     } else {
                         return fail("激活请求被拒绝（HTTP ${result.code}），请检查网络后重试")
                     }
             }
         }
         if (stopped) return false
+        if (generation != myGeneration) return false
         if (!activated) {
             return fail("等待绑定超时（${activationTimeoutMs / 1000}s 内未检测到激活），请点击连接重新获取激活码")
         }
@@ -189,6 +211,28 @@ class XiaozhiSession(
             )
         }
         return openSession(refreshed)
+    }
+
+    /**
+     * 激活等待期的休眠：默认睡满一个轮询间隔，但 UI 调用 [nudgeActivation]
+     * （用户在 xiaozhi.me 输完码点"立即检测"）时立即醒来做下一轮检测。
+     *
+     * 背景：App 切到后台（去浏览器输码）时轮询协程可能被系统冻结或限制网络，
+     * 回到前台后如果只剩几秒就到下一轮，用户面对的是完全静止的界面——
+     * 必须给用户一个主动触发检测的手段，而不是干等。
+     */
+    private suspend fun waitActivationInterval() {
+        val seen = activationNudge.value
+        withTimeoutOrNull(activationPollIntervalMs) {
+            activationNudge.first { it != seen }
+        }
+    }
+
+    /** NeedActivation 阶段由 UI 调用：立即唤醒激活循环做一轮检测 */
+    fun nudgeActivation() {
+        if (_phase.value is Phase.NeedActivation) {
+            activationNudge.value = activationNudge.value + 1
+        }
     }
 
     /**

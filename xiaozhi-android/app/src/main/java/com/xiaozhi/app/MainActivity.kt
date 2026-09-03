@@ -112,7 +112,7 @@ private data class PhaseStyle(
 private fun styleFor(phase: XiaozhiSession.Phase, emotion: String): PhaseStyle = when (phase) {
     is XiaozhiSession.Phase.Idle -> PhaseStyle("💤", "未连接", Color(0xFF9AA3B2), false)
     is XiaozhiSession.Phase.FetchingConfig -> PhaseStyle("🔄", "获取配置…", BrandBlue, true)
-    is XiaozhiSession.Phase.NeedActivation -> PhaseStyle("🔑", "需要激活", Color(0xFFF5A524), false)
+    is XiaozhiSession.Phase.NeedActivation -> PhaseStyle("🔑", "等待绑定确认…", Color(0xFFF5A524), true)
     is XiaozhiSession.Phase.Connecting -> PhaseStyle("🔗", "连接中…", BrandBlue, true)
     is XiaozhiSession.Phase.Ready -> PhaseStyle("🙂", "就绪，按住说话", Color(0xFF22C55E), false)
     is XiaozhiSession.Phase.Listening -> PhaseStyle("🎤", "聆听中…", Color(0xFFE24B4A), true)
@@ -180,7 +180,12 @@ fun XiaozhiScreen(vm: XiaozhiViewModel = viewModel()) {
             Spacer(Modifier.height(14.dp))
             val code = activationCode
             if (code != null) {
-                ActivationCard(code) { copyToClipboard(context, code) }
+                ActivationCard(
+                    code = code,
+                    deviceId = vm.deviceId,
+                    onCopy = { copyToClipboard(context, code) },
+                    onCheck = { vm.nudgeActivation() },
+                )
             }
 
             Spacer(Modifier.weight(1f))
@@ -200,6 +205,13 @@ fun XiaozhiScreen(vm: XiaozhiViewModel = viewModel()) {
                 },
                 onConnect = {
                     activationCode = null
+                    vm.start { activationCode = it }
+                },
+                // 激活等待中点"重新获取"= 先断开旧的激活循环再重新拉码。
+                // Session 侧已加防重入：不先 stop 直接 start 会被拒绝
+                onReconnect = {
+                    activationCode = null
+                    vm.disconnect()
                     vm.start { activationCode = it }
                 },
                 onDisconnect = vm::disconnect,
@@ -307,7 +319,12 @@ private fun MessagePanel(phase: XiaozhiSession.Phase, subtitle: String) {
 }
 
 @Composable
-private fun ActivationCard(code: String, onCopy: () -> Unit) {
+private fun ActivationCard(
+    code: String,
+    deviceId: String,
+    onCopy: () -> Unit,
+    onCheck: () -> Unit,
+) {
     ElevatedCard(shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
         Column(
             Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
@@ -322,7 +339,26 @@ private fun ActivationCard(code: String, onCopy: () -> Unit) {
                 letterSpacing = 8.sp,
                 color = InkPrimary,
             )
-            TextButton(onClick = onCopy) { Text("复制激活码", fontSize = 13.sp) }
+            Spacer(Modifier.height(6.dp))
+            // 用户输码后最困惑的就是"界面没反应"：给一个主动触发检测的按钮，
+            // 并说明自动检测的存在，避免干等
+            TextButton(onClick = onCheck) {
+                Text("我已输码，立即检测", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            }
+            Text(
+                "输码成功后通常几秒内自动连接；切到后台输码回来后若长时间无反应，点上方按钮立即检测",
+                fontSize = 11.sp,
+                color = InkSecondary,
+                textAlign = TextAlign.Center,
+            )
+            TextButton(onClick = onCopy) { Text("复制激活码", fontSize = 12.sp) }
+            // 设备号用于与 xiaozhi.me 的设备列表核对：
+            // 多次重装/重置会产生多个设备条目，绑错条目时手机永远"没反应"
+            Text(
+                "设备号 $deviceId",
+                fontSize = 10.sp,
+                color = InkSecondary.copy(alpha = 0.7f),
+            )
         }
     }
 }
@@ -333,6 +369,7 @@ private fun ControlBar(
     style: PhaseStyle,
     onTalk: () -> Unit,
     onConnect: () -> Unit,
+    onReconnect: () -> Unit,
     onDisconnect: () -> Unit,
     onAbort: () -> Unit,
 ) {
@@ -340,9 +377,8 @@ private fun ControlBar(
     val speaking = phase is XiaozhiSession.Phase.Speaking
     // 说话中也允许按下：onTalk 会先打断再开始听
     val canTalk = phase is XiaozhiSession.Phase.Ready || listening || speaking
-    val idle = phase is XiaozhiSession.Phase.Idle ||
-        phase is XiaozhiSession.Phase.Error ||
-        phase is XiaozhiSession.Phase.NeedActivation
+    val needActivation = phase is XiaozhiSession.Phase.NeedActivation
+    val idle = phase is XiaozhiSession.Phase.Idle || phase is XiaozhiSession.Phase.Error
     val busyConnecting = phase is XiaozhiSession.Phase.FetchingConfig ||
         phase is XiaozhiSession.Phase.Connecting
 
@@ -351,9 +387,17 @@ private fun ControlBar(
         horizontalArrangement = Arrangement.spacedBy(18.dp),
     ) {
         SecondaryButton(
-            text = if (idle) "连接" else "断开",
+            text = when {
+                needActivation -> "重新获取"
+                idle -> "连接"
+                else -> "断开"
+            },
             enabled = !busyConnecting,
-            onClick = if (idle) onConnect else onDisconnect,
+            onClick = when {
+                needActivation -> onReconnect
+                idle -> onConnect
+                else -> onDisconnect
+            },
         )
 
         TalkButton(enabled = canTalk, listening = listening, style = style, onClick = onTalk)

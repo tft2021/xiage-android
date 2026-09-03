@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -863,6 +864,119 @@ class XiaozhiSessionTest {
         session.stop()
         assertEquals(XiaozhiSession.Phase.Idle, session.phase.value)
         assertTrue(transport.closed)
+    }
+
+    // -------------------------------------------- 第四轮加固：激活等待体验
+
+    @Test
+    fun `激活等待中重复 start 被拒绝不会并发两个循环`() = runBlocking {
+        val first = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "123456",
+            activationChallenge = "challenge-x",
+        )
+        val ota = FakeOtaApi(mutableListOf(first), mutableListOf())
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(), audio = FakeAudioIO(), otaApi = ota,
+            activationPollIntervalMs = 50,
+        )
+
+        // start() 在激活循环里不返回，必须后台跑
+        launch { session.start(identity, { }) }
+        awaitPhase(session) { it is XiaozhiSession.Phase.NeedActivation }
+
+        // 激活等待中再点"连接"必须被拒绝：否则两个循环互相覆盖 phase
+        val again = session.start(identity, { })
+        assertFalse(again)
+        assertIs<XiaozhiSession.Phase.NeedActivation>(session.phase.value)
+        // 第二次 start 没有再拉配置
+        assertEquals(1, ota.checkVersionCalls.size)
+        session.stop()
+    }
+
+    @Test
+    fun `nudgeActivation 立即唤醒等待而不必等满轮询间隔`() = runBlocking {
+        val first = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "123456",
+            activationChallenge = "challenge-x",
+        )
+        val refreshed = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = "bound-token",
+        )
+        // 第一次 activate Waiting（模拟用户还没输码），nudge 后下一次 Success
+        val ota = FakeOtaApi(
+            mutableListOf(first, refreshed),
+            mutableListOf(ActivateResult.Waiting, ActivateResult.Success),
+        )
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(), audio = FakeAudioIO(), otaApi = ota,
+            // 轮询间隔设成远大于测试超时：能进 Connecting 只能靠 nudge 唤醒
+            activationPollIntervalMs = 60_000,
+        )
+
+        launch { session.start(identity, { }) }
+        awaitPhase(session) { it is XiaozhiSession.Phase.NeedActivation }
+        // 用户输完码，点"立即检测"
+        session.nudgeActivation()
+
+        // 5s 内应完成激活 + re-OTA + 建立 WebSocket（绝不能等满 60s）
+        awaitPhase(session, timeoutMs = 5_000) { it is XiaozhiSession.Phase.Connecting }
+        session.transportFieldForTest().open()
+        awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
+        session.stop()
+    }
+
+    @Test
+    fun `激活等待中重新获取旧循环退场新循环接手`() = runBlocking {
+        val first = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "111111",
+            activationChallenge = "challenge-1",
+        )
+        val second = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "222222",
+            activationChallenge = "challenge-2",
+        )
+        val refreshed = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = "bound-token",
+        )
+        val ota = FakeOtaApi(
+            mutableListOf(first, second, refreshed),
+            mutableListOf(ActivateResult.Waiting, ActivateResult.Success),
+        )
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(), audio = FakeAudioIO(), otaApi = ota,
+            // 200ms：旧循环的第二次 activate 排在新流程之后，时序可控
+            activationPollIntervalMs = 200,
+        )
+
+        val codes = mutableListOf<String>()
+        launch { session.start(identity, { codes.add(it) }) }
+        awaitPhase(session) { it is XiaozhiSession.Phase.NeedActivation }
+        assertEquals("111111", (session.phase.value as XiaozhiSession.Phase.NeedActivation).code)
+
+        // UI"重新获取"：stop -> start（新世代）。旧循环必须在醒来后立刻退场
+        session.stop()
+        assertEquals(XiaozhiSession.Phase.Idle, session.phase.value)
+
+        val ok = session.start(identity, { codes.add(it) })
+        assertTrue(ok)
+        // 展示过两个码：旧循环一次、新循环一次
+        assertEquals(listOf("111111", "222222"), codes)
+        session.transportFieldForTest().open()
+        awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
+        session.stop()
     }
 }
 

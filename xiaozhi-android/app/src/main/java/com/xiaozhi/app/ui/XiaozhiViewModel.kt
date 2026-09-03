@@ -24,6 +24,9 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
 
     val session: XiaozhiSession
 
+    /** 当前设备身份的 device_id，激活界面展示用于与 xiaozhi.me 设备列表核对 */
+    val deviceId: String
+
     init {
         val audio = AudioEngine(viewModelScope)
         val transport = XiaozhiWsClient(viewModelScope)
@@ -34,6 +37,7 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
             audio = audio,
             codecProvider = ConcentusCodecProvider(),
         )
+        deviceId = loadIdentity().deviceId
     }
 
     /** ViewModel 生命周期内的 Application Context，用于身份持久化 */
@@ -55,6 +59,9 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
     fun startListening() = session.startListening()
     fun stopListening() = session.stopListening()
     fun abort() = session.abort()
+
+    /** 激活等待期"我已输码，立即检测"：跳过轮询间隔马上做一轮检测 */
+    fun nudgeActivation() = session.nudgeActivation()
 
     /** 主动断开：关闭 WebSocket、释放音频，phase 回到 Idle 后可再次连接 */
     fun disconnect() = session.stop()
