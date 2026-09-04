@@ -180,6 +180,28 @@ fun XiaozhiScreen(vm: XiaozhiViewModel = viewModel()) {
 
             MessagePanel(phase, subtitle)
 
+            // 错误信息建议"重置设备身份"时必须给出按钮——出错后激活码卡片已被清空，
+            // 只把按钮放在卡片里会让引导落空、用户被卡死（真机实测踩坑）
+            val errMsg = (phase as? XiaozhiSession.Phase.Error)?.message
+            if (errMsg != null && errMsg.contains("重置设备身份")) {
+                Spacer(Modifier.height(10.dp))
+                TextButton(
+                    onClick = {
+                        vm.resetIdentity()
+                        Toast.makeText(
+                            context, "设备身份已重置，请点连接获取新的激活码", Toast.LENGTH_LONG
+                        ).show()
+                    },
+                ) {
+                    Text(
+                        "重置设备身份，重新开始绑定",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color(0xFFB42318),
+                    )
+                }
+            }
+
             Spacer(Modifier.height(14.dp))
             val code = activationCode
             if (code != null) {

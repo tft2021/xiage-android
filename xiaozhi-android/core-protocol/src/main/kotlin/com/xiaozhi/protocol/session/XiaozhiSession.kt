@@ -320,7 +320,7 @@ class XiaozhiSession(
         if (config.isTestGroup) {
             // 重置身份重试后仍是测试组凭据：绑定确实没生效，带出设备标识便于排查
             return fail(
-                "凭据仍为测试组，绑定未生效。请在设置中重置设备身份后重试 " +
+                "凭据仍为测试组，绑定未生效。请点击下方「重置设备身份」按钮重新开始绑定 " +
                     "（device_id=${identity?.deviceId}, client_id=${identity?.clientId}）"
             )
         }
