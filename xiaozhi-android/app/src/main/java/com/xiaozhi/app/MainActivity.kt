@@ -113,8 +113,14 @@ private fun styleFor(phase: XiaozhiSession.Phase, emotion: String): PhaseStyle =
     is XiaozhiSession.Phase.Idle -> PhaseStyle("💤", "未连接", Color(0xFF9AA3B2), false)
     is XiaozhiSession.Phase.FetchingConfig -> PhaseStyle("🔄", "获取配置…", BrandBlue, true)
     is XiaozhiSession.Phase.NeedActivation -> PhaseStyle("🔑", "等待绑定确认…", Color(0xFFF5A524), true)
-    is XiaozhiSession.Phase.FetchingCredentials ->
-        PhaseStyle("✅", "绑定成功，正在获取凭据…", Color(0xFF22C55E), true)
+    is XiaozhiSession.Phase.FetchingCredentials -> {
+        val p = phase as XiaozhiSession.Phase.FetchingCredentials
+        PhaseStyle(
+            "✅",
+            "绑定成功，正在获取凭据…（第 ${p.attempt + 1} 次，最长 5 分钟，无需操作）",
+            Color(0xFF22C55E), true,
+        )
+    }
     is XiaozhiSession.Phase.Connecting -> PhaseStyle("🔗", "连接中…", BrandBlue, true)
     is XiaozhiSession.Phase.Ready -> PhaseStyle("🙂", "就绪，按住说话", Color(0xFF22C55E), false)
     is XiaozhiSession.Phase.Listening -> PhaseStyle("🎤", "聆听中…", Color(0xFFE24B4A), true)

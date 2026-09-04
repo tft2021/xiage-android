@@ -53,15 +53,18 @@ class XiaozhiSession(
      * 保留参数只为测试（传 0 即每轮都刷新）。
      */
     private val challengeRefreshIntervalMs: Long = Long.MAX_VALUE,
-    /** 激活成功后重新拉配置的次数（服务端绑定生效可能有短暂延迟） */
-    private val postActivateOtaRetries: Int = 10,
+    /**
+     * 激活成功后重新拉配置的次数。对齐 py-xiaozhi 的耐心级别
+     * （它的激活轮询就是 60 次 × 5s）：服务端下发凭据可能延迟到分钟级
+     */
+    private val postActivateOtaRetries: Int = 30,
     /**
      * 判定配置"不健康"后、同身份重试前的等待。
      * 给服务端下发真实凭据留出时间，避免把刚绑定的身份误判成异常而丢弃。
      */
     private val unhealthyRetryDelayMs: Long = 3_000,
-    /** 激活成功后重新拉配置的重试间隔（总窗口 = 次数 × 间隔 ≈ 20s） */
-    private val postActivateRetryDelayMs: Long = 2_000,
+    /** 激活成功后重新拉配置的重试间隔（总窗口 = 次数 × 间隔 = 5 分钟） */
+    private val postActivateRetryDelayMs: Long = 10_000,
 ) {
 
     sealed class Phase {
@@ -69,8 +72,11 @@ class XiaozhiSession(
         data object FetchingConfig : Phase()
         /** 需要激活，code 为 6 位激活码，展示给用户去 xiaozhi.me 输入 */
         data class NeedActivation(val code: String) : Phase()
-        /** /activate 已返回 200（服务端确认绑定），正在等 OTA 下发真实凭据 */
-        data object FetchingCredentials : Phase()
+        /**
+         * /activate 已返回 200（服务端确认绑定），正在等 OTA 下发真实凭据。
+         * attempt 为已重试次数，UI 据此显示进度
+         */
+        data class FetchingCredentials(val attempt: Int) : Phase()
         data object Connecting : Phase()
         /** 收到服务端 hello，会话已建立；sampleRate 为协商的下行采样率 */
         data class Ready(val sampleRate: Int) : Phase()
@@ -193,7 +199,7 @@ class XiaozhiSession(
                     // 绑定已被服务端确认：从激活码界面切到"获取凭据中"，
                     // 让用户知道输码生效了，只差最后一步
                     if (_phase.value is Phase.NeedActivation) {
-                        _phase.value = Phase.FetchingCredentials
+                        _phase.value = Phase.FetchingCredentials(attempt = 0)
                     }
                 }
                 ActivateResult.Waiting -> waitActivationInterval()
@@ -217,6 +223,8 @@ class XiaozhiSession(
         for (attempt in 1..postActivateOtaRetries) {
             // 用户点了断开/重新获取：立即退场，不要继续占用 OTA
             if (stopped || generation != myGeneration) return false
+            // 每次重试更新进度，UI 显示"已等待 N 次"
+            _phase.value = Phase.FetchingCredentials(attempt)
             refreshed = try {
                 otaApi.checkVersion(effective)
             } catch (_: Exception) {
