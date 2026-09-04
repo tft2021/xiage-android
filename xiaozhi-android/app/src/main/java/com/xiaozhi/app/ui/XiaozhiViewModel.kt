@@ -5,6 +5,7 @@ import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xiaozhi.app.audio.AudioEngine
+import com.xiaozhi.app.net.ConfiguredOtaClient
 import com.xiaozhi.protocol.debug.DebugLog
 import com.xiaozhi.protocol.ota.DeviceIdentity
 import com.xiaozhi.protocol.ota.DeviceCredentials
@@ -51,15 +52,27 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
         val audio = AudioEngine(viewModelScope)
         val transport = XiaozhiWsClient(viewModelScope)
         // Concentus（纯 Java Opus）编解码：上行 16k/60ms，下行按 hello 协商采样率
+        // OTA 地址可由调试设置覆盖（ConfiguredOtaClient 每次调用时读取，改完即生效）
+        otaClient = ConfiguredOtaClient(application)
         session = XiaozhiSession(
             scope = viewModelScope,
             transport = transport,
             audio = audio,
+            otaApi = otaClient,
             codecProvider = ConcentusCodecProvider(),
         )
         everBound = sp.getBoolean("ever_bound", false)
         identityResets = sp.getInt("identity_resets", 0)
     }
+
+    /** 可配置 OTA 客户端（读 SharedPreferences 的 ota_url，默认官方） */
+    val otaClient: ConfiguredOtaClient
+
+    /** 当前生效的服务端地址（诊断与设置界面展示） */
+    val effectiveOtaUrl: String get() = otaClient.effectiveUrl()
+
+    /** 保存服务端地址设置（下次连接生效） */
+    fun saveOtaUrl(raw: String) = ConfiguredOtaClient.save(appContext, raw)
 
     /** ViewModel 生命周期内的 Application Context，用于身份持久化 */
     private val appContext: Context get() = getApplication()
@@ -141,6 +154,8 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
             appendLine("client_id: ${id.clientId}")
             appendLine("serial_number: ${id.credentials.serialNumber}")
             appendLine("hmac_key: ${id.credentials.hmacKey}")
+            appendLine("--- 服务端 ---")
+            appendLine("ota_url: ${otaClient.effectiveUrl()}")
             appendLine("--- 绑定标记 ---")
             appendLine("ever_bound: $everBound")
             appendLine("identity_resets: $identityResets")

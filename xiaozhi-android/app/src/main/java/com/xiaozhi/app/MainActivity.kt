@@ -32,11 +32,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -153,6 +155,7 @@ fun XiaozhiScreen(vm: XiaozhiViewModel = viewModel()) {
     val deviceId by vm.deviceId.collectAsState()
     val context = LocalContext.current
     var activationCode by remember { mutableStateOf<String?>(null) }
+    var showServerDialog by remember { mutableStateOf(false) }
 
     // 只有处于"需要激活"阶段才展示激活码卡片。连接中 / 已就绪 / 出错（含激活超时）
     // 时旧码已失效，必须清掉，否则用户会拿一个服务端已经作废的码去 xiaozhi.me 输入。
@@ -271,12 +274,78 @@ fun XiaozhiScreen(vm: XiaozhiViewModel = viewModel()) {
                     color = InkSecondary,
                 )
             }
+            // 调试版服务端切换：默认官方，可指向自建模拟服务端（改完下次连接即生效）
+            TextButton(onClick = { showServerDialog = true }) {
+                Text(
+                    if (vm.effectiveOtaUrl == com.xiaozhi.app.net.ConfiguredOtaClient.DEFAULT_OTA_URL)
+                        "服务端：官方" else "服务端：自定义",
+                    fontSize = 12.sp,
+                    color = InkSecondary,
+                )
+            }
+            if (showServerDialog) {
+                ServerUrlDialog(
+                    initial = vm.effectiveOtaUrl,
+                    onSave = {
+                        vm.saveOtaUrl(it)
+                        Toast.makeText(
+                            context, "已保存，下次点「连接」生效", Toast.LENGTH_SHORT
+                        ).show()
+                    },
+                    onDismiss = { showServerDialog = false },
+                )
+            }
             Spacer(Modifier.height(24.dp))
         }
     }
 }
 
 // ------------------------------------------------------------------ 组件
+
+/**
+ * 服务端地址设置对话框（调试用）。
+ * 支持两种输入：只给主机（http://192.168.1.5:8000，自动补 /xiaozhi/ota/）
+ * 或完整 OTA 地址。清空 = 恢复官方默认。
+ */
+@Composable
+private fun ServerUrlDialog(
+    initial: String,
+    onSave: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var text by remember { mutableStateOf(initial) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("服务端地址", fontSize = 17.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    singleLine = true,
+                    label = { Text("OTA 地址") },
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "自建模拟服务端填 http://<电脑IP>:8000（自动补路径）\n" +
+                        "清空恢复官方 api.tenclass.net\n保存后下次「连接」生效",
+                    fontSize = 12.sp,
+                    color = InkSecondary,
+                    lineHeight = 18.sp,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                onSave(text)
+                onDismiss()
+            }) { Text("保存") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
+}
 
 @Composable
 private fun StatusPill(style: PhaseStyle) {
