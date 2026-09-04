@@ -48,6 +48,9 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
      */
     private var identityResets: Int
 
+    /** 可配置 OTA 客户端（读 SharedPreferences 的 ota_url，默认官方） */
+    val otaClient: ConfiguredOtaClient
+
     init {
         val audio = AudioEngine(viewModelScope)
         val transport = XiaozhiWsClient(viewModelScope)
@@ -64,9 +67,6 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
         everBound = sp.getBoolean("ever_bound", false)
         identityResets = sp.getInt("identity_resets", 0)
     }
-
-    /** 可配置 OTA 客户端（读 SharedPreferences 的 ota_url，默认官方） */
-    val otaClient: ConfiguredOtaClient
 
     /** 当前生效的服务端地址（诊断与设置界面展示） */
     val effectiveOtaUrl: String get() = otaClient.effectiveUrl()
