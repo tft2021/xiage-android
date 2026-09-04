@@ -29,7 +29,7 @@ class OtaClient(
     /** 服务端认识的板型名，沿用 py-xiaozhi 的值 */
     private val boardType: String = "bread-compact-wifi",
     private val appName: String = "xiaozhi-android",
-    private val appVersion: String = "2.1.7",
+    private val appVersion: String = "2.1.8",
     private val acceptLanguage: String = "zh-CN",
 ) : OtaApi {
 

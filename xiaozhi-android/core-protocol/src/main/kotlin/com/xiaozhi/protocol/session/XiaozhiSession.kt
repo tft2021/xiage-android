@@ -54,14 +54,14 @@ class XiaozhiSession(
      */
     private val challengeRefreshIntervalMs: Long = Long.MAX_VALUE,
     /** 激活成功后重新拉配置的次数（服务端绑定生效可能有短暂延迟） */
-    private val postActivateOtaRetries: Int = 3,
+    private val postActivateOtaRetries: Int = 10,
     /**
      * 判定配置"不健康"后、同身份重试前的等待。
      * 给服务端下发真实凭据留出时间，避免把刚绑定的身份误判成异常而丢弃。
      */
     private val unhealthyRetryDelayMs: Long = 3_000,
-    /** 激活成功后重新拉配置的重试间隔 */
-    private val postActivateRetryDelayMs: Long = 1_500,
+    /** 激活成功后重新拉配置的重试间隔（总窗口 = 次数 × 间隔 ≈ 20s） */
+    private val postActivateRetryDelayMs: Long = 2_000,
 ) {
 
     sealed class Phase {
@@ -69,6 +69,8 @@ class XiaozhiSession(
         data object FetchingConfig : Phase()
         /** 需要激活，code 为 6 位激活码，展示给用户去 xiaozhi.me 输入 */
         data class NeedActivation(val code: String) : Phase()
+        /** /activate 已返回 200（服务端确认绑定），正在等 OTA 下发真实凭据 */
+        data object FetchingCredentials : Phase()
         data object Connecting : Phase()
         /** 收到服务端 hello，会话已建立；sampleRate 为协商的下行采样率 */
         data class Ready(val sampleRate: Int) : Phase()
@@ -186,7 +188,14 @@ class XiaozhiSession(
                 ActivateResult.Failed(NETWORK_ERROR_CODE, e.message.orEmpty())
             }
             when (result) {
-                ActivateResult.Success -> activated = true
+                ActivateResult.Success -> {
+                    activated = true
+                    // 绑定已被服务端确认：从激活码界面切到"获取凭据中"，
+                    // 让用户知道输码生效了，只差最后一步
+                    if (_phase.value is Phase.NeedActivation) {
+                        _phase.value = Phase.FetchingCredentials
+                    }
+                }
                 ActivateResult.Waiting -> waitActivationInterval()
                 is ActivateResult.Failed ->
                     if (result.code == NETWORK_ERROR_CODE) {
@@ -206,6 +215,8 @@ class XiaozhiSession(
         // 服务端绑定生效可能有短暂延迟，允许重试几次再判失败。
         var refreshed: OtaConfig? = null
         for (attempt in 1..postActivateOtaRetries) {
+            // 用户点了断开/重新获取：立即退场，不要继续占用 OTA
+            if (stopped || generation != myGeneration) return false
             refreshed = try {
                 otaApi.checkVersion(effective)
             } catch (_: Exception) {
@@ -214,12 +225,12 @@ class XiaozhiSession(
             if (refreshed != null && !refreshed.isTestGroup) break
             if (attempt < postActivateOtaRetries) delay(postActivateRetryDelayMs)
         }
-        // 重试耗尽仍是测试组：说明服务端尚未下发真实凭据，直接连必然被拒，
-        // 这里显式报错（而不是带测试组凭据去连），避免用户看到"凭据仍为测试组"的困惑提示。
+        // 重试耗尽仍是测试组：绑定已确认但凭据下发有延迟（实测可能超过 5s），
+        // 这里显式报错并给出恢复路径；身份绝不能在此处更换
         if (refreshed == null || refreshed.isTestGroup) {
             return fail(
-                "激活已提交，但服务端尚未下发真实凭据（已重试 $postActivateOtaRetries 次），" +
-                    "请稍后点击连接重试"
+                "绑定已确认，但服务端下发凭据延迟（已重试 $postActivateOtaRetries 次）。" +
+                    "请等 10 秒后点击连接重试；若反复出现，请核对激活界面设备号与 xiaozhi.me 是否一致"
             )
         }
         return openSession(refreshed)

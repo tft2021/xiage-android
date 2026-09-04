@@ -561,8 +561,51 @@ class XiaozhiSessionTest {
 
         assertFalse(session.start(identity, { }))
         val err = assertIs<XiaozhiSession.Phase.Error>(session.phase.value)
-        assertTrue(err.message.contains("尚未下发真实凭据"), "实际: ${err.message}")
+        assertTrue(err.message.contains("下发凭据延迟"), "实际: ${err.message}")
+        assertTrue(err.message.contains("点击连接"), "报错必须给出恢复路径")
         assertTrue(transport.connectedUrl == null, "拿不到真实凭据时不应带测试组凭据去连")
+        session.stop()
+    }
+
+    @Test
+    fun `激活成功后先进入 FetchingCredentials 再建立连接`() = runBlocking {
+        val pending = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/",
+            websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "777777",
+            activationChallenge = "challenge-v",
+        )
+        val stale = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = OtaConfig.TEST_TOKEN)
+        val bound = OtaConfig.minimal(websocketUrl = "wss://fake/v1/", websocketToken = "bound-token")
+        val ota = FakeOtaApi(
+            mutableListOf(pending, stale, bound),
+            mutableListOf(ActivateResult.Success),
+        )
+        val transport = FakeTransport()
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = transport, audio = FakeAudioIO(), otaApi = ota,
+            // 第一次重试前等 500ms：留出观察 FetchingCredentials 阶段的窗口
+            postActivateRetryDelayMs = 500,
+        )
+
+        val seen = mutableListOf<XiaozhiSession.Phase>()
+        val collector = launch { session.phase.collect { seen.add(it) } }
+        launch { session.start(identity, { }) }
+        // 离开激活码界面（可能快到抓不到 NeedActivation，允许直接看到 FetchingCredentials）
+        awaitPhase(session, timeoutMs = 10_000) {
+            it is XiaozhiSession.Phase.FetchingCredentials || it is XiaozhiSession.Phase.Connecting
+        }
+        // 服务端凭据延迟，重试后拿到真实凭据 → Connecting
+        awaitPhase(session, timeoutMs = 10_000) { it is XiaozhiSession.Phase.Connecting }
+        collector.cancel()
+        assertTrue(
+            seen.any { it is XiaozhiSession.Phase.FetchingCredentials },
+            "激活成功后应经过 FetchingCredentials，实际: ${seen.map { it::class.simpleName }}",
+        )
+        assertEquals("bound-token", transport.connectedToken)
+        transport.open()
+        awaitPhase(session) { it is XiaozhiSession.Phase.Ready }
         session.stop()
     }
 

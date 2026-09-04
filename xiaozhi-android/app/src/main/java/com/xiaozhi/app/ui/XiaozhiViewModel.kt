@@ -11,7 +11,8 @@ import com.xiaozhi.protocol.ota.PersistedIdentity
 import com.xiaozhi.protocol.session.XiaozhiSession
 import com.xiaozhi.protocol.audio.ConcentusCodecProvider
 import com.xiaozhi.protocol.ws.XiaozhiWsClient
-import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /**
@@ -25,8 +26,11 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
 
     val session: XiaozhiSession
 
-    /** 当前设备身份的 device_id，激活界面展示用于与 xiaozhi.me 设备列表核对 */
-    val deviceId: String
+    /** 当前设备身份的 device_id，激活界面展示用于与 xiaozhi.me 设备列表核对。
+     *  用 StateFlow 而非 val：重置身份后必须立即反映到界面上，
+     *  否则用户拿着旧设备号去核对 xiaozhi.me 必然对不上 */
+    private val _deviceId = MutableStateFlow(loadIdentity().deviceId)
+    val deviceId: StateFlow<String> = _deviceId
 
     /**
      * 这台设备是否曾经成功建立过真实会话（即曾经绑定成功）。
@@ -52,19 +56,8 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
             audio = audio,
             codecProvider = ConcentusCodecProvider(),
         )
-        deviceId = loadIdentity().deviceId
         everBound = sp.getBoolean("ever_bound", false)
         identityResets = sp.getInt("identity_resets", 0)
-
-        // 进入 Ready 说明服务端接受了当前凭据 => 该身份是"已绑定"的，此后不得自动丢弃
-        viewModelScope.launch {
-            session.phase.collect { phase ->
-                if (phase is XiaozhiSession.Phase.Ready && !everBound) {
-                    everBound = true
-                    sp.edit().putBoolean("ever_bound", true).apply()
-                }
-            }
-        }
     }
 
     /** ViewModel 生命周期内的 Application Context，用于身份持久化 */
@@ -75,7 +68,9 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
     /** 连接入口：由 UI 显式触发（首次进入不自动连，等麦克风权限就绪） */
     fun start(onActivationCode: (String) -> Unit) {
         viewModelScope.launch {
-            session.start(
+            // start() 返回 true = 会话建立（进入过 Ready）= 服务端接受了当前凭据，
+            // 该身份是"已绑定"的，此后不得自动丢弃
+            val ok = session.start(
                 loadIdentity(),
                 onActivationCode,
                 // 两个硬约束：绑定过的设备不换；重置次数达上限不换。
@@ -87,8 +82,14 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
                     identityResets++
                     sp.edit().putInt("identity_resets", identityResets).apply()
                     persistIdentity(fresh)
+                    // 身份变了必须同步到界面，否则设备号显示的是旧值
+                    _deviceId.value = fresh.deviceId
                 },
             )
+            if (ok && !everBound) {
+                everBound = true
+                sp.edit().putBoolean("ever_bound", true).apply()
+            }
         }
     }
 
@@ -104,14 +105,17 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
 
     /**
      * 手动重置设备身份（用户确认绑错设备条目时使用）。
-     * 清掉持久化身份与 ever_bound 标记，下次连接会生成全新身份、拿到新激活码，
-     * 届时需重新到 xiaozhi.me 绑定。
+     * 清掉持久化身份与 ever_bound 标记，并**立即生成并持久化新身份**——
+     * 激活界面显示的设备号同步刷新，用户据此到 xiaozhi.me 重新绑定。
      */
     fun resetIdentity() {
         session.stop()
         sp.edit().clear().apply()
         everBound = false
         identityResets = 0
+        val fresh = DeviceIdentity.create(null)
+        persistIdentity(fresh)
+        _deviceId.value = fresh.deviceId
     }
 
     private companion object {
