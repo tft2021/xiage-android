@@ -43,11 +43,23 @@ class XiaozhiSession(
     private val activationTimeoutMs: Long = 5 * 60_000,
     /**
      * 轮询期间重新拉配置刷新 challenge 的间隔。
-     * 实测：服务端每次 OTA 都换新 challenge，长期用旧 challenge 有失效风险。
+     *
+     * **默认禁用**：2026-09-04 实测（probe/probe_activate_semantics.py）证明
+     * 服务端在绑定前对 /activate 根本不校验 challenge —— 用旧 challenge 签名返回的
+     * 也是同一个 202。于是"刷新 challenge"对激活成功毫无帮助，却有两个确定的害处：
+     *  1. 多发的 OTA 请求可能让服务端刷新激活码，导致用户刚在 xiaozhi.me 输的码作废，
+     *     表现就是"每点一次连接激活码就变一次"，永远绑不上
+     *  2. 白白消耗请求配额
+     * 保留参数只为测试（传 0 即每轮都刷新）。
      */
-    private val challengeRefreshIntervalMs: Long = 60_000,
+    private val challengeRefreshIntervalMs: Long = Long.MAX_VALUE,
     /** 激活成功后重新拉配置的次数（服务端绑定生效可能有短暂延迟） */
     private val postActivateOtaRetries: Int = 3,
+    /**
+     * 判定配置"不健康"后、同身份重试前的等待。
+     * 给服务端下发真实凭据留出时间，避免把刚绑定的身份误判成异常而丢弃。
+     */
+    private val unhealthyRetryDelayMs: Long = 3_000,
     /** 激活成功后重新拉配置的重试间隔 */
     private val postActivateRetryDelayMs: Long = 1_500,
 ) {
@@ -255,18 +267,29 @@ class XiaozhiSession(
         val first = otaApi.checkVersion(identity)
         if (isHealthy(first)) return identity to first
 
-        // 1) 同身份重试，排除偶发脏响应
+        // 1) 同身份重试，排除偶发脏响应。
+        //    **必须带延迟**：用户在 xiaozhi.me 刚绑完就点连接时，服务端下发真实凭据
+        //    可能有几秒滞后；间隔为 0 的连续重试拿到的是同样滞后的脏响应，
+        //    会被误判成"身份异常"进而换掉身份 —— 那等于把用户刚建立的绑定关系丢掉，
+        //    表现就是"每次连接激活码都不一样，永远绑不上"。
+        delay(unhealthyRetryDelayMs)
         val retry = otaApi.checkVersion(identity)
         if (isHealthy(retry)) return identity to retry
 
-        // 2) 换新身份试探
+        // 2) 换新身份试探。
+        //    **UI 不传 onIdentityReset 即表示不允许换身份**：曾经成功绑定过的设备
+        //    一旦自动换身份就等于丢掉用户已建立的绑定关系，表现正是
+        //    "xiaozhi.me 显示已绑定、手机上却永远在等激活"，且每次连接激活码都不一样。
+        //    这个不可逆操作必须由 UI 显式授权。
+        if (onIdentityReset == null) return identity to retry
+
         val fresh = DeviceIdentity.create(null)
         val second = otaApi.checkVersion(fresh)
 
         // 3) 新身份同样异常 -> 回滚原身份，不丢绑定
         if (!isHealthy(second)) return identity to second
 
-        onIdentityReset?.invoke(fresh) // 只有确认新身份可用才持久化
+        onIdentityReset.invoke(fresh) // 只有确认新身份可用才持久化
         return fresh to second
     }
 

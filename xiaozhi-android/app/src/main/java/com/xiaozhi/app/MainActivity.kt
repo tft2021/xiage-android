@@ -185,6 +185,13 @@ fun XiaozhiScreen(vm: XiaozhiViewModel = viewModel()) {
                     deviceId = vm.deviceId,
                     onCopy = { copyToClipboard(context, code) },
                     onCheck = { vm.nudgeActivation() },
+                    onResetIdentity = {
+                        activationCode = null
+                        vm.resetIdentity()
+                        Toast.makeText(
+                            context, "设备身份已重置，请点连接获取新的激活码", Toast.LENGTH_LONG
+                        ).show()
+                    },
                 )
             }
 
@@ -324,6 +331,7 @@ private fun ActivationCard(
     deviceId: String,
     onCopy: () -> Unit,
     onCheck: () -> Unit,
+    onResetIdentity: () -> Unit,
 ) {
     ElevatedCard(shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
         Column(
@@ -353,12 +361,17 @@ private fun ActivationCard(
             )
             TextButton(onClick = onCopy) { Text("复制激活码", fontSize = 12.sp) }
             // 设备号用于与 xiaozhi.me 的设备列表核对：
-            // 多次重装/重置会产生多个设备条目，绑错条目时手机永远"没反应"
+            // 多次重装/重置会产生多个设备条目，绑错条目时手机永远"没反应"。
+            // 若每次连接设备号都在变，说明身份被反复重置——先删掉 xiaozhi.me 上的
+            // 旧条目再用当前码重绑；确实绑错时可用"重置设备身份"换一个新身份。
             Text(
                 "设备号 $deviceId",
                 fontSize = 10.sp,
                 color = InkSecondary.copy(alpha = 0.7f),
             )
+            TextButton(onClick = onResetIdentity) {
+                Text("重置设备身份", fontSize = 11.sp, color = Color(0xFFB42318))
+            }
         }
     }
 }

@@ -869,6 +869,39 @@ class XiaozhiSessionTest {
     // -------------------------------------------- 第四轮加固：激活等待体验
 
     @Test
+    fun `不允许换身份时绝不自动重置身份`() = runBlocking {
+        // 前两次都是"测试组 + 无激活码"的异常响应；第三个配置模拟新身份可用
+        val bad1 = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/", websocketToken = OtaConfig.TEST_TOKEN,
+        )
+        val bad2 = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/", websocketToken = OtaConfig.TEST_TOKEN,
+        )
+        val freshOk = OtaConfig.minimal(
+            websocketUrl = "wss://fake/v1/", websocketToken = OtaConfig.TEST_TOKEN,
+            activationCode = "999999", activationChallenge = "challenge-fresh",
+        )
+        val ota = FakeOtaApi(mutableListOf(bad1, bad2, freshOk), mutableListOf())
+        val session = XiaozhiSession(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default),
+            transport = FakeTransport(), audio = FakeAudioIO(), otaApi = ota,
+        )
+
+        // 不传 onIdentityReset = UI 不允许换身份（曾绑定成功的设备）
+        val ok = session.start(identity, { })
+        assertFalse(ok)
+        // 只应有 first + retry 两次 OTA：绝不能拿新身份去做第三次试探
+        assertEquals(
+            2, ota.checkVersionCalls.size,
+            "不允许换身份时不得发起新身份试探，实际 ${ota.checkVersionCalls.size} 次",
+        )
+        // 两次用的都是原身份
+        assertEquals(listOf(identity.deviceId, identity.deviceId),
+            ota.checkVersionCalls.map { it.deviceId })
+        session.stop()
+    }
+
+    @Test
     fun `激活等待中重复 start 被拒绝不会并发两个循环`() = runBlocking {
         val first = OtaConfig.minimal(
             websocketUrl = "wss://fake/v1/",
