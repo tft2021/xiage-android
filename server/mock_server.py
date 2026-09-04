@@ -378,7 +378,7 @@ async def ws_session(request: web.Request) -> web.WebSocketResponse | web.Respon
                 if state == "start":
                     opus_count = 0
                 elif state == "stop":
-                    # 模拟一轮完整对话：stt -> llm -> tts(start/sentence_start/stop)
+                    # 模拟一轮完整对话：stt -> llm -> tts(start/sentence_start/…/stop)
                     await ws.send_json({
                         "type": "stt", "session_id": session_id,
                         "text": f"(模拟识别) 收到 {opus_count} 帧语音",
@@ -396,6 +396,9 @@ async def ws_session(request: web.Request) -> web.WebSocketResponse | web.Respon
                         "state": "sentence_start",
                         "text": "模拟服务端已收到你的语音！客户端全链路正常。",
                     })
+                    # 真实服务端在 start 与 stop 之间会流式下发音频（数秒）；
+                    # 背靠背发送会让客户端 Speaking 相位成为瞬态、被 StateFlow 合并
+                    await asyncio.sleep(1.5)
                     await ws.send_json({
                         "type": "tts", "session_id": session_id,
                         "state": "stop",
