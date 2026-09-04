@@ -5,6 +5,7 @@ import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xiaozhi.app.audio.AudioEngine
+import com.xiaozhi.protocol.debug.DebugLog
 import com.xiaozhi.protocol.ota.DeviceIdentity
 import com.xiaozhi.protocol.ota.DeviceCredentials
 import com.xiaozhi.protocol.ota.PersistedIdentity
@@ -116,6 +117,36 @@ class XiaozhiViewModel(application: Application) : AndroidViewModel(application)
         val fresh = DeviceIdentity.create(null)
         persistIdentity(fresh)
         _deviceId.value = fresh.deviceId
+    }
+
+    /**
+     * 导出全部诊断信息（调试版）：身份四元组 + 绑定标记 + 事件日志快照。
+     * 定位「绑定已确认但服务端永不下发凭据」这类只在真机发生的问题——
+     * 一次复现的完整轨迹（每次 OTA/激活的请求响应原文 + 状态机决策）都在里面。
+     */
+    fun dumpDiagnostics(): String {
+        val id = loadIdentity()
+        return buildString {
+            appendLine("=== 小智 Android 诊断信息 ===")
+            runCatching {
+                val pi = appContext.packageManager.getPackageInfo(appContext.packageName, 0)
+                @Suppress("DEPRECATION") // minSdk 26 < longVersionCode 的 API 28
+                appendLine("app_version: ${pi.versionName} (${pi.versionCode})")
+            }
+            appendLine("export_time: ${java.text.SimpleDateFormat(
+                "yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US
+            ).format(java.util.Date())}")
+            appendLine("--- 身份 ---")
+            appendLine("device_id: ${id.deviceId}")
+            appendLine("client_id: ${id.clientId}")
+            appendLine("serial_number: ${id.credentials.serialNumber}")
+            appendLine("hmac_key: ${id.credentials.hmacKey}")
+            appendLine("--- 绑定标记 ---")
+            appendLine("ever_bound: $everBound")
+            appendLine("identity_resets: $identityResets")
+            appendLine("current_phase: ${session.phase.value}")
+            append(DebugLog.dump())
+        }
     }
 
     private companion object {

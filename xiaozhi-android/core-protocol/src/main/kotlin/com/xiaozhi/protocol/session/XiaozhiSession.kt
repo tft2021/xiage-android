@@ -4,6 +4,7 @@ import com.xiaozhi.protocol.audio.AudioCodecProvider
 import com.xiaozhi.protocol.audio.AudioIO
 import com.xiaozhi.protocol.audio.NoOpCodecProvider
 import com.xiaozhi.protocol.audio.OpusDecoder
+import com.xiaozhi.protocol.debug.DebugLog
 import com.xiaozhi.protocol.ota.ActivateResult
 import com.xiaozhi.protocol.ota.DeviceIdentity
 import com.xiaozhi.protocol.ota.OtaApi
@@ -127,12 +128,16 @@ class XiaozhiSession(
         // 防重入：激活/连接进行中再 start 会并发跑两个循环，互相覆盖 phase。
         // UI 需要重新获取激活码时必须先 stop() 再 start()。
         when (_phase.value) {
-            is Phase.FetchingConfig, is Phase.Connecting, is Phase.NeedActivation -> return false
+            is Phase.FetchingConfig, is Phase.Connecting, is Phase.NeedActivation -> {
+                dbg { "start 被拒绝（防重入），当前 phase=${_phase.value}" }
+                return false
+            }
             else -> {}
         }
         val myGeneration = ++generation
         stopped = false
-        _phase.value = Phase.FetchingConfig
+        dbg { "start 开始 gen=$myGeneration device=${identity.deviceId} client=${identity.clientId} serial=${identity.credentials.serialNumber} everBound 允许重置=${onIdentityReset != null}" }
+        setPhase(Phase.FetchingConfig)
 
         val (effective, config) = try {
             fetchConfigWithRecovery(identity, onIdentityReset)
@@ -143,6 +148,7 @@ class XiaozhiSession(
 
         // 服务端未下发激活码说明该设备已绑定，直接进会话
         if (!config.needsActivation) {
+            dbg { "首次 OTA 即已绑定（needsActivation=false, isTestGroup=${config.isTestGroup}），直接开会话" }
             return openSession(config)
         }
 
@@ -152,15 +158,21 @@ class XiaozhiSession(
         if (initialChallenge.isNullOrEmpty()) return fail("服务端未下发激活 challenge")
         var code: String = initialCode
         var challenge: String = initialChallenge
+        dbg { "进入激活流程 code=$code challenge=$challenge" }
         onNeedActivation(code)
-        _phase.value = Phase.NeedActivation(code)
+        setPhase(Phase.NeedActivation(code))
 
         var activated = false
         val deadline = System.currentTimeMillis() + activationTimeoutMs
         var lastChallengeRefresh = System.currentTimeMillis()
+        var pollRound = 0
         while (!activated && System.currentTimeMillis() < deadline && !stopped) {
             // 被"重新获取"取代：新 start() 已把世代推进，本循环立即退场
-            if (generation != myGeneration) return false
+            if (generation != myGeneration) {
+                dbg { "激活循环退场：gen $myGeneration 已被 ${generation} 取代" }
+                return false
+            }
+            pollRound++
             // 实测：服务端每次 OTA 都会刷新 challenge，长期用旧 challenge 轮询有失效风险。
             // 定期重新拉配置既刷新 challenge，又能顺带发现「用户已绑定」。
             if (System.currentTimeMillis() - lastChallengeRefresh >= challengeRefreshIntervalMs) {
@@ -171,10 +183,12 @@ class XiaozhiSession(
                 }
                 if (polled != null) {
                     lastChallengeRefresh = System.currentTimeMillis()
+                    dbg { "轮询刷新配置 round=$pollRound -> ${configSummary(polled)}" }
                     // 只有"无激活码且非测试组"才算真正绑定成功。
                     // 若刷新拿到测试组凭据（服务端瞬时脏响应），不能当成已绑定去连，
                     // 也不能因此中断等待——保持原 challenge 继续轮询。
                     if (!polled.needsActivation && !polled.isTestGroup) {
+                        dbg { "轮询刷新发现已绑定，直接开会话" }
                         return openSession(polled)
                     }
                     polled.activationChallenge?.let { challenge = it }
@@ -182,7 +196,7 @@ class XiaozhiSession(
                     if (newCode != null && newCode != code) {
                         code = newCode
                         onNeedActivation(code)
-                        _phase.value = Phase.NeedActivation(code)
+                        setPhase(Phase.NeedActivation(code))
                     }
                 }
             }
@@ -196,23 +210,34 @@ class XiaozhiSession(
             when (result) {
                 ActivateResult.Success -> {
                     activated = true
+                    dbg { "激活成功 round=$pollRound：/activate 返回 200，绑定已被服务端确认" }
                     // 绑定已被服务端确认：从激活码界面切到"获取凭据中"，
                     // 让用户知道输码生效了，只差最后一步
                     if (_phase.value is Phase.NeedActivation) {
-                        _phase.value = Phase.FetchingCredentials(attempt = 0)
+                        setPhase(Phase.FetchingCredentials(attempt = 0))
                     }
                 }
-                ActivateResult.Waiting -> waitActivationInterval()
+                ActivateResult.Waiting -> {
+                    dbg { "激活等待中 round=$pollRound：202（服务端认为未绑定）" }
+                    waitActivationInterval()
+                }
                 is ActivateResult.Failed ->
                     if (result.code == NETWORK_ERROR_CODE) {
+                        dbg { "激活轮询网络异常 round=$pollRound: ${result.body}" }
                         waitActivationInterval() // 网络问题：重试
                     } else {
                         return fail("激活请求被拒绝（HTTP ${result.code}），请检查网络后重试")
                     }
             }
         }
-        if (stopped) return false
-        if (generation != myGeneration) return false
+        if (stopped) {
+            dbg { "激活循环被 stop() 中断" }
+            return false
+        }
+        if (generation != myGeneration) {
+            dbg { "激活循环退场：gen $myGeneration 已被 ${generation} 取代" }
+            return false
+        }
         if (!activated) {
             return fail("等待绑定超时（${activationTimeoutMs / 1000}s 内未检测到激活），请点击连接重新获取激活码")
         }
@@ -222,20 +247,26 @@ class XiaozhiSession(
         var refreshed: OtaConfig? = null
         for (attempt in 1..postActivateOtaRetries) {
             // 用户点了断开/重新获取：立即退场，不要继续占用 OTA
-            if (stopped || generation != myGeneration) return false
+            if (stopped || generation != myGeneration) {
+                dbg { "凭据重试循环退场 attempt=$attempt stopped=$stopped gen=$myGeneration/${generation}" }
+                return false
+            }
             // 每次重试更新进度，UI 显示"已等待 N 次"
-            _phase.value = Phase.FetchingCredentials(attempt)
+            setPhase(Phase.FetchingCredentials(attempt))
             refreshed = try {
                 otaApi.checkVersion(effective)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                dbg { "凭据重试 attempt=$attempt 网络异常: ${e.message}" }
                 null
             }
+            dbg { "凭据重试 attempt=$attempt/$postActivateOtaRetries -> ${refreshed?.let { configSummary(it) } ?: "请求失败"}" }
             if (refreshed != null && !refreshed.isTestGroup) break
             if (attempt < postActivateOtaRetries) delay(postActivateRetryDelayMs)
         }
         // 重试耗尽仍是测试组：绑定已确认但凭据下发有延迟（实测可能超过 5s），
         // 这里显式报错并给出恢复路径；身份绝不能在此处更换
         if (refreshed == null || refreshed.isTestGroup) {
+            dbg { "凭据重试耗尽：绑定已确认但 ${postActivateOtaRetries} 次重试后仍未拿到真实凭据" }
             return fail(
                 "绑定已确认，但服务端下发凭据延迟（已重试 $postActivateOtaRetries 次）。" +
                     "请等 10 秒后点击连接重试；若反复出现，请核对激活界面设备号与 xiaozhi.me 是否一致"
@@ -262,6 +293,7 @@ class XiaozhiSession(
     /** NeedActivation 阶段由 UI 调用：立即唤醒激活循环做一轮检测 */
     fun nudgeActivation() {
         if (_phase.value is Phase.NeedActivation) {
+            dbg { "用户触发立即检测（nudge）" }
             activationNudge.value = activationNudge.value + 1
         }
     }
@@ -284,6 +316,7 @@ class XiaozhiSession(
         onIdentityReset: ((DeviceIdentity) -> Unit)?,
     ): Pair<DeviceIdentity, OtaConfig> {
         val first = otaApi.checkVersion(identity)
+        dbg { "首次 OTA -> ${configSummary(first)} healthy=${isHealthy(first)}" }
         if (isHealthy(first)) return identity to first
 
         // 1) 同身份重试，排除偶发脏响应。
@@ -291,8 +324,10 @@ class XiaozhiSession(
         //    可能有几秒滞后；间隔为 0 的连续重试拿到的是同样滞后的脏响应，
         //    会被误判成"身份异常"进而换掉身份 —— 那等于把用户刚建立的绑定关系丢掉，
         //    表现就是"每次连接激活码都不一样，永远绑不上"。
+        dbg { "首次 OTA 不健康，${unhealthyRetryDelayMs}ms 后同身份重试" }
         delay(unhealthyRetryDelayMs)
         val retry = otaApi.checkVersion(identity)
+        dbg { "同身份重试 OTA -> ${configSummary(retry)} healthy=${isHealthy(retry)}" }
         if (isHealthy(retry)) return identity to retry
 
         // 2) 换新身份试探。
@@ -300,14 +335,23 @@ class XiaozhiSession(
         //    一旦自动换身份就等于丢掉用户已建立的绑定关系，表现正是
         //    "xiaozhi.me 显示已绑定、手机上却永远在等激活"，且每次连接激活码都不一样。
         //    这个不可逆操作必须由 UI 显式授权。
-        if (onIdentityReset == null) return identity to retry
+        if (onIdentityReset == null) {
+            dbg { "OTA 仍不健康，但 UI 未授权换身份（everBound/重置达上限），维持原身份继续" }
+            return identity to retry
+        }
 
         val fresh = DeviceIdentity.create(null)
+        dbg { "OTA 仍不健康，换新身份试探 device=${fresh.deviceId} serial=${fresh.credentials.serialNumber}" }
         val second = otaApi.checkVersion(fresh)
+        dbg { "新身份 OTA -> ${configSummary(second)} healthy=${isHealthy(second)}" }
 
         // 3) 新身份同样异常 -> 回滚原身份，不丢绑定
-        if (!isHealthy(second)) return identity to second
+        if (!isHealthy(second)) {
+            dbg { "新身份同样不健康 -> 服务端侧问题，回滚原身份" }
+            return identity to second
+        }
 
+        dbg { "新身份健康，通知 UI 持久化（身份重置生效）" }
         onIdentityReset.invoke(fresh) // 只有确认新身份可用才持久化
         return fresh to second
     }
@@ -327,13 +371,15 @@ class XiaozhiSession(
 
         if (config.isTestGroup) {
             // 重置身份重试后仍是测试组凭据：绑定确实没生效，带出设备标识便于排查
+            dbg { "openSession 拒绝：凭据为测试组（token=${mask(token)}），绑定未生效" }
             return fail(
                 "凭据仍为测试组，绑定未生效。请点击下方「重置设备身份」按钮重新开始绑定 " +
                     "（device_id=${identity?.deviceId}, client_id=${identity?.clientId}）"
             )
         }
 
-        _phase.value = Phase.Connecting
+        dbg { "openSession url=$url token=${mask(token)} device=${identity?.deviceId}" }
+        setPhase(Phase.Connecting)
         messageJob = scope.launch { collectMessages() }
         stateJob = scope.launch { collectConnectionState() }
         decoderJob = scope.launch(Dispatchers.IO) { collectOpusFrames() }
@@ -371,14 +417,14 @@ class XiaozhiSession(
             }
             is XiaozhiMessage.Tts -> when (msg.state) {
                 TtsState.START -> {
-                    _phase.value = Phase.Speaking(msg.text)
+                    setPhase(Phase.Speaking(msg.text))
                     // AudioTrack 尚未初始化或被 release 时 flush 会抛异常，
                     // 由 collectMessages 统一兜住：丢一次 flush 不影响后续播放
                     audio.flushPlayback()
                 }
                 TtsState.SENTENCE_START -> msg.text?.let { _subtitle.value = it }
                 TtsState.STOP -> if (_phase.value is Phase.Speaking) {
-                    _phase.value = Phase.Ready(downlinkSampleRate)
+                    setPhase(Phase.Ready(downlinkSampleRate))
                 }
             }
             is XiaozhiMessage.Alert ->
@@ -393,7 +439,8 @@ class XiaozhiSession(
                 is ConnectionState.Open -> {
                     // 下行采样率以服务端 hello 协商结果为准（可能 24k，也可能 16k）
                     downlinkSampleRate = st.audioParams?.sampleRate ?: DEFAULT_DOWNLINK_RATE
-                    _phase.value = Phase.Ready(downlinkSampleRate)
+                    dbg { "WebSocket 已打开，hello 协商采样率=$downlinkSampleRate" }
+                    setPhase(Phase.Ready(downlinkSampleRate))
                     // 设备不支持该采样率时 AudioTrack 初始化会抛异常；
                     // 这里必须接住，否则 stateJob 被取消，整个会话一起失效
                     try {
@@ -464,7 +511,7 @@ class XiaozhiSession(
             return
         }
         transport.send(XiaozhiMessage.Listen(com.xiaozhi.protocol.ws.ListenState.START))
-        _phase.value = Phase.Listening
+        setPhase(Phase.Listening)
     }
 
     /** 停止聆听，等服务端回复 */
@@ -474,7 +521,7 @@ class XiaozhiSession(
             transport.send(XiaozhiMessage.Listen(com.xiaozhi.protocol.ws.ListenState.STOP))
             audio.stopCapture()
         }
-        _phase.value = Phase.Ready(downlinkSampleRate)
+        setPhase(Phase.Ready(downlinkSampleRate))
     }
 
     /** 用户打断 TTS 播放 */
@@ -487,23 +534,49 @@ class XiaozhiSession(
         }
         // 立刻回到 Ready，让用户能马上接下一句，不必等服务端补发 TTS stop。
         // 服务端随后若发来 TTS stop，collectMessages 里只处理 Speaking 态，不会重复切换。
-        if (_phase.value is Phase.Speaking) _phase.value = Phase.Ready(downlinkSampleRate)
+        if (_phase.value is Phase.Speaking) setPhase(Phase.Ready(downlinkSampleRate))
     }
 
     fun stop() {
         stopped = true
+        dbg { "stop()：主动断开，phase=${_phase.value}" }
         // 先置 Idle 再 close：transport.close() 会同步 emit Closed，
         // 而 stateJob 的取消是异步生效的，晚一步就把主动断开误判成"被服务端关闭"了
-        _phase.value = Phase.Idle
+        setPhase(Phase.Idle)
         decoderJob?.cancel(); messageJob?.cancel(); stateJob?.cancel()
         guard("释放音频资源") { audio.releaseAll() }
         guard("关闭连接") { transport.close() }
     }
 
     private fun fail(message: String): Boolean {
+        dbg { "fail：$message" }
         _phase.value = Phase.Error(message)
         return false
     }
+
+    // ------------------------------------------------------------------ 调试埋点
+
+    /** 统一的 phase 切换入口：先记录转换再赋值，诊断日志即状态机轨迹 */
+    private fun setPhase(p: Phase) {
+        if (_phase.value != p) {
+            DebugLog.log("phase", "${_phase.value} -> $p")
+        }
+        _phase.value = p
+    }
+
+    private inline fun dbg(block: () -> String) {
+        DebugLog.log("session", block())
+    }
+
+    /** OTA 配置摘要：判定绑定状态所需的全部字段，一条日志看全 */
+    private fun configSummary(c: OtaConfig): String =
+        "needsActivation=${c.needsActivation} isTestGroup=${c.isTestGroup} " +
+            "code=${c.activationCode} token=${c.websocketToken?.let { mask(it) }} " +
+            "mqttClient=${c.mqttClientId} wsUrl=${c.websocketUrl}"
+
+    /** 凭据脱敏：保留前 12 字符足够判断 test-token 与真实凭据 */
+    private fun mask(token: String): String =
+        if (token.length <= 12) token else "${token.take(12)}…(${token.length})"
 
     /**
      * 非致命内部异常记录。core-protocol 是纯 JVM 模块，不能依赖 android.util.Log；

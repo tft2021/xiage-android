@@ -255,7 +255,23 @@ fun XiaozhiScreen(vm: XiaozhiViewModel = viewModel()) {
                 onDisconnect = vm::disconnect,
                 onAbort = vm::abort,
             )
-            Spacer(Modifier.height(36.dp))
+
+            // 调试版常驻入口：任何阶段都能一键导出诊断信息。
+            // 复现一次「连接→输码→等待」后点这里，把剪贴板内容发回即可定位
+            Spacer(Modifier.height(10.dp))
+            TextButton(
+                onClick = {
+                    val text = vm.dumpDiagnostics()
+                    copyDiagnostics(context, text)
+                },
+            ) {
+                Text(
+                    "复制诊断信息",
+                    fontSize = 12.sp,
+                    color = InkSecondary,
+                )
+            }
+            Spacer(Modifier.height(24.dp))
         }
     }
 }
@@ -511,4 +527,14 @@ private fun copyToClipboard(context: Context, text: String) {
     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
     cm.setPrimaryClip(ClipData.newPlainText("activation_code", text))
     Toast.makeText(context, "激活码已复制", Toast.LENGTH_SHORT).show()
+}
+
+/** 诊断信息导出：体量大，Toast 提示字数让用户确认复制成功 */
+private fun copyDiagnostics(context: Context, text: String) {
+    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: run {
+        Toast.makeText(context, "复制失败：剪贴板不可用", Toast.LENGTH_SHORT).show()
+        return
+    }
+    cm.setPrimaryClip(ClipData.newPlainText("xiaozhi_diagnostics", text))
+    Toast.makeText(context, "诊断信息已复制（${text.length} 字符），请粘贴发回", Toast.LENGTH_LONG).show()
 }

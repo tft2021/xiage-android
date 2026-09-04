@@ -1,5 +1,6 @@
 package com.xiaozhi.protocol.ota
 
+import com.xiaozhi.protocol.debug.DebugLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -59,15 +60,24 @@ class OtaClient(
         try {
             conn.requestMethod = "POST"
             conn.setDoOutput(true)
+            dbg { "checkVersion REQ -> $otaUrl UA=$boardType/$appName-$appVersion Device-Id=${identity.deviceId} Client-Id=${identity.clientId} body=${body}" }
             conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
 
             val code = conn.responseCode
             if (code != 200) {
                 val err = conn.errorStream?.bufferedReader()?.readText().orEmpty()
+                dbg { "checkVersion RESP <- HTTP $code body=$err" }
                 throw OtaException(code, "OTA checkVersion 失败: $err")
             }
-            parseConfig(JSONObject(conn.inputStream.bufferedReader().readText()))
+            val respText = conn.inputStream.bufferedReader().readText()
+            dbg { "checkVersion RESP <- HTTP 200 body=$respText" }
+            parseConfig(JSONObject(respText))
                 .also { lastConfig = it }
+        } catch (e: OtaException) {
+            throw e
+        } catch (e: Exception) {
+            dbg { "checkVersion 网络异常: ${e.javaClass.simpleName}: ${e.message}" }
+            throw e
         } finally {
             conn.disconnect()
         }
@@ -95,21 +105,35 @@ class OtaClient(
         try {
             conn.requestMethod = "POST"
             conn.setDoOutput(true)
+            dbg { "activate REQ -> $url serial=${identity.credentials.serialNumber} challenge=$challenge payload=${payload}" }
             conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-            when (conn.responseCode) {
+            // 2xx 的响应体走 inputStream，>=400 走 errorStream；两边都读出来记录
+            val code = conn.responseCode
+            val respText = try {
+                conn.inputStream?.bufferedReader()?.readText()
+            } catch (_: Exception) {
+                conn.errorStream?.bufferedReader()?.readText()
+            }.orEmpty()
+            dbg { "activate RESP <- HTTP $code body=$respText" }
+            when (code) {
                 200 -> ActivateResult.Success
                 202 -> ActivateResult.Waiting
-                else -> ActivateResult.Failed(
-                    conn.responseCode,
-                    conn.errorStream?.bufferedReader()?.readText().orEmpty(),
-                )
+                else -> ActivateResult.Failed(code, respText)
             }
+        } catch (e: Exception) {
+            dbg { "activate 网络异常: ${e.javaClass.simpleName}: ${e.message}" }
+            throw e
         } finally {
             conn.disconnect()
         }
     }
 
     // ------------------------------------------------------------------ internal
+
+    /** 调试埋点：无 DebugLog 依赖负担，纯 JVM 可用 */
+    private inline fun dbg(block: () -> String) {
+        DebugLog.log("ota", block())
+    }
 
     private fun open(identity: DeviceIdentity, activationVersion: String): HttpURLConnection =
         (URL(otaUrl).openConnection() as HttpURLConnection).apply {
