@@ -86,7 +86,14 @@ def main():
         ap.error("需要 -m 或 -F 指定提交信息")
 
     files = args.files or staged_files()
-    files = sorted({f.replace("\\", "/").lstrip("./") for f in files})
+
+    def norm_path(f: str) -> str:
+        f = f.replace("\\", "/")
+        while f.startswith("./"):  # 只剥相对路径前缀，不能用 lstrip——会把 .gitignore 的点也剥掉
+            f = f[2:]
+        return f
+
+    files = sorted({norm_path(f) for f in files})
     if not files:
         ap.error("没有要提交的文件")
 
